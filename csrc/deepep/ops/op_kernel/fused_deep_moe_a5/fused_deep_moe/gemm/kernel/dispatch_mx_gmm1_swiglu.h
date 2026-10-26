@@ -23,7 +23,7 @@
 constexpr uint32_t STATE_OFFSET = 512;
 constexpr uint64_t WIN_STATE_OFFSET = 512 * 1024;
 constexpr uint64_t STATE_WIN_OFFSET = 900 * 1024;
-constexpr uint64_t GROUP_TOKEN_NUM_OFFSET = FusedDeepMoeSync::GROUP_TOKEN_NUM_OFFSET;
+constexpr uint64_t GROUP_TOKEN_NUM_OFFSET = FusedDeepMoeSync::GROUP_TOKE N_NUM_OFFSET;
 constexpr uint64_t SOFT_SYNC_OFFSET = 964 * 1024;
 constexpr uint64_t SHARE_QUANT_SOFT_SYNC_OFFSET = 1000 * 1024;
 constexpr uint32_t SELF_STATE_OFFSET = 256 * 1024;
