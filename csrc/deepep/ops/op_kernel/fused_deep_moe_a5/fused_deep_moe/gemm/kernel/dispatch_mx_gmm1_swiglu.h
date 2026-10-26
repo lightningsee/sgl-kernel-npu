@@ -23,7 +23,7 @@
 constexpr uint32_t STATE_OFFSET = 512;
 constexpr uint64_t WIN_STATE_OFFSET = 512 * 1024;
 constexpr uint64_t STATE_WIN_OFFSET = 900 * 1024;
-constexpr uint64_t GROUP_TOKEN_NUM_OFFSET = FusedDeepMoeSync::GROUP_TOKE N_NUM_OFFSET;
+constexpr uint64_t GROUP_TOKEN_NUM_OFFSET = FusedDeepMoeSync::GROUP_TOKEN_NUM_OFFSET;
 constexpr uint64_t SOFT_SYNC_OFFSET = 964 * 1024;
 constexpr uint64_t SHARE_QUANT_SOFT_SYNC_OFFSET = 1000 * 1024;
 constexpr uint32_t SELF_STATE_OFFSET = 256 * 1024;
@@ -247,12 +247,11 @@ public:
         aivNum = aiCoreGroupNum * SUB_AIV_NUM;  // 1C2V
         //识别cube和vector 取id
         if ASCEND_IS_AIV {
-            if (AscendC::GetSubBlockIdx() == 1) {
-                return;  // 1C1V改法，屏蔽掉其中1个AIV核
-            } else {
-               aivIdx = aiCoreGroupIdx;
+            // 核心修改 1：移除 return，用 isActiveAiv 标记 SubBlock 0
+            isActiveAiv = (AscendC::GetSubBlockIdx() == 0);
+            if (isActiveAiv) {
+                aivIdx = aiCoreGroupIdx;
             }
-            //aivIdx = AscendC::GetBlockIdx();
         }
         if ASCEND_IS_AIC {
             aicIdx = AscendC::GetBlockIdx();
@@ -263,9 +262,12 @@ public:
         statusDataSpaceGm = Mc2Kernel::GetStatusDataSpaceGm(winContext_);// 从当前通信群组中获取数据状态同步区的基址
         // 
         if ASCEND_IS_AIV {
-            compCoreNum = aiCoreGroupNum;
-            isCompCore = true;
-            compCoreIdx = aiCoreGroupIdx;
+            // 核心修改 2：只有激活的核才去接管业务变量
+            if (isActiveAiv) {
+                compCoreNum = aiCoreGroupNum;
+                isCompCore = true;
+                compCoreIdx = aiCoreGroupIdx;
+            }
         }
         if constexpr ((EXEC_FLAG & EXEC_FLAG_DEEP_FUSE) == 0) {
             return;
@@ -279,14 +281,16 @@ public:
         }
         AscendC::GlobalTensor<int32_t> selfDataStatusTensor;
         selfDataStatusTensor.SetGlobalBuffer((__gm__ int32_t *)(statusDataSpaceGm + STATE_WIN_OFFSET));
+        uint32_t realAivNum = aiCoreGroupNum * 2;
         if ASCEND_IS_AIC {
             
-            aicStateGlobalCoreIdx = aivNum + aicIdx;
+            aicStateGlobalCoreIdx = realAivNum + aicIdx;//aicStateGlobalCoreIdx = aivNum + aicIdx;
             cvDataState = FlushAndSpinValue<int32_t>(selfDataStatusTensor, aicStateGlobalCoreIdx * UB_ALIGN);//乘以32 强制空间填充，避免伪共享，这是业务bus interface 总线的最小传输块是32字节的block，如果是紧凑可能会导致状态信息污染
             vToCFlag = (cvDataState == 0) ? V_TO_C_FLAG_1 : V_TO_C_FLAG_2;
         }
         if ASCEND_IS_AIV {
             //偶数核负责 rec
+            if (isActiveAiv) {
             isRecvCore = ((aiCoreGroupIdx % ODD_EVEN_BASE) == 0);
             recvCoreIdx = aiCoreGroupIdx/2;
             //奇数核负责send
@@ -297,11 +301,16 @@ public:
                 shareQuantCoreIdx = recvCoreIdx;
             }
             // 状态同步区偏移计算 (因为 aivNum 已减半，这里的偏移会自动紧凑排布)
-            aivStateGlobalCoreIdx = aivNum + aicNum + aivIdx;
+            uint32_t realAivIdx = aiCoreGroupIdx * 2 + AscendC::GetSubBlockIdx();
+            
+            // 修复 2：AIV 的全局偏移量计算必须用真实的 realAivNum 和 realAivIdx
+            aivStateGlobalCoreIdx = realAivNum + aicNum + realAivIdx;
+            //aivStateGlobalCoreIdx = aivNum + aicNum + aivIdx;
 
-            dataState = FlushAndSpinValue<int32_t>(selfDataStatusTensor, aivIdx * UB_ALIGN);
+            dataState = FlushAndSpinValue<int32_t>(selfDataStatusTensor, realAivIdx * UB_ALIGN);//dataState = FlushAndSpinValue<int32_t>(selfDataStatusTensor, aivIdx * UB_ALIGN);
             cvDataState = FlushAndSpinValue<int32_t>(selfDataStatusTensor, aivStateGlobalCoreIdx * UB_ALIGN);
             vToCFlag = (cvDataState == 0) ? V_TO_C_FLAG_1 : V_TO_C_FLAG_2;
+            }
         }
     }
 
@@ -1892,6 +1901,29 @@ public:
     CATLASS_DEVICE void operator()<AscendC::AIV>(Params const &params)
     {
         AscendC::SetCtrlSpr<60, 60>(0);
+        if (!isActiveAiv) {
+            // 被屏蔽的 SubBlock 1 必须完美复现 SubBlock 0 遇到的所有 SyncAll 同步点！
+            if constexpr (EXEC_FLAG & EXEC_FLAG_DEEP_FUSE) {
+                if (!params.enableRoutedSparseFastPath) {
+                    AivOnlySync(); // 对应第一次同步
+                    AivOnlySync(); // 对应第二次同步
+                } else {
+                    AscendC::PipeBarrier<PIPE_MTE3>();
+                    AscendC::SyncAll<false>(); // 对应 Sparse 模式下的同步
+                    AscendC::PipeBarrier<PIPE_ALL>();
+                }
+            }
+            
+            // 对应结尾处的最后一次全局同步
+            if constexpr (EXEC_FLAG & EXEC_FLAG_DEEP_FUSE) {
+                AscendC::SyncAll<true>();
+            } else {
+                AscendC::SyncAll<false>();
+            }
+            AscendC::PipeBarrier<PIPE_ALL>();
+            
+            return; // 履行完所有同步义务后，安全退出！
+        }
         AivInitParams(params);
         if constexpr (EXEC_FLAG & EXEC_FLAG_DEEP_FUSE) {
             AivInitState();
@@ -2234,6 +2266,7 @@ private:
     int64_t ubOffset;
 
     // core info
+    bool isActiveAiv{true};  // 新增：用于标记当前 AIV 核是否需要执行业务
     bool isSendCore{false};
     bool isRecvCore{false};
     bool isCompCore{false};        // calculate deq_swiglu
