@@ -964,7 +964,7 @@ static ge::graphStatus FusedDeepMoeTilingFuncImpl(gert::TilingContext &context)
                OPS_LOG_E(nodeName, "A5 fused requires 1C2V, but got aicNum=%u and aivNum=%u.", aicNum, aivNum),
                return ge::GRAPH_FAILED);
     tilingData->fusedDeepMoeInfo.aicNum = aicNum;
-    tilingData->fusedDeepMoeInfo.aivNum = aivNum;
+    tilingData->fusedDeepMoeInfo.aivNum = aicNum;
     OPS_ERR_IF(CheckData(nodeName, *tilingData) != ge::GRAPH_SUCCESS, OPS_LOG_E(nodeName, "CheckData failed."),
                return ge::GRAPH_FAILED);
     const gert::StorageShape *xActiveMaskStorageShape = context.GetOptionalInputShape(INPUT_SHARE_X_ACTIVE_MASK_INDEX);

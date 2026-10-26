@@ -338,7 +338,7 @@ public:
         AscendC::Duplicate(notifyLocalTensor, static_cast<int32_t>(0), INT32_COUNT_PER_BLOCK);
         AscendC::SetFlag<AscendC::HardEvent::V_S>(0);
         AscendC::WaitFlag<AscendC::HardEvent::V_S>(0);
-        notifyLocalTensor.SetValue(0, SUB_AIV_NUM == 1 ? 2 : 1);//修改：
+        notifyLocalTensor.SetValue(0, 1);//修改：
         AscendC::SetFlag<AscendC::HardEvent::S_MTE3>(0);
         AscendC::WaitFlag<AscendC::HardEvent::S_MTE3>(0);
         AscendC::SetAtomicAdd<int32_t>();
@@ -358,7 +358,7 @@ public:
         AscendC::Duplicate(notifyLocalTensor, static_cast<int32_t>(0), INT32_COUNT_PER_BLOCK);
         AscendC::SetFlag<AscendC::HardEvent::V_S>(0);
         AscendC::WaitFlag<AscendC::HardEvent::V_S>(0);
-        notifyLocalTensor.SetValue(FusedDeepMoeSync::X2_READY_COUNTER_INDEX, SUB_AIV_NUM == 1 ? 2 : 1);
+        notifyLocalTensor.SetValue(FusedDeepMoeSync::X2_READY_COUNTER_INDEX,  1);
         AscendC::SetFlag<AscendC::HardEvent::S_MTE3>(0);
         AscendC::WaitFlag<AscendC::HardEvent::S_MTE3>(0);
         AscendC::PipeBarrier<PIPE_MTE3>();
