@@ -462,7 +462,7 @@ __aicore__ inline void FusedDeepMoe<TemplateMC2TypeFunc>::Process()
         gmShareWeight1Scale_, gmShareMm1SwapSpace, gmShareSwigluOut, gmShareX2, gmShareX2Scale, gmX_, gmexpertIds_,
         xActiveMask_, gmSmoothScales_, gmShareSmoothScales_, gmExpandIdx, gmEpSendCount, gmExpertTokenNums_,
         gmX2ReadyState, gmRoutedGroupMeta, gmRoutedActiveGroupCount, gmRoutedActiveGroupIds,
-        tilingData_->fusedDeepMoeInfo, &profileWriter);
+        tilingData_->fusedDeepMoeInfo, &profileWriter); // gemm1起点 dispatch + swiglu + quantize + notify
     uint64_t stageBarrierStart = 0U;
     if (profileWriter.enabled) {
         stageBarrierStart = profileWriter.Now();
