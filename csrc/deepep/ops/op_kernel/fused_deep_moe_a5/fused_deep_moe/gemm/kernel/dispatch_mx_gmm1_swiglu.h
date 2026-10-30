@@ -208,6 +208,7 @@ public:
               ptrShareX2(reinterpret_cast<__gm__ ElementA *>(ptrShareX2_)),
               gmShareX2Scale(reinterpret_cast<__gm__ ElementMxScaleA *>(gmShareX2Scale_)),
               gmX(gmX_),  
+              gmExpertIds(gmExpertIds_),        
               gmXActiveMask(gmXActiveMask_),
               gmMoeSmoothScales(gmMoeSmoothScales_),
               gmShareSmoothScales(gmShareSmoothScales_),
@@ -239,18 +240,18 @@ public:
     CATLASS_DEVICE
     DispatchMxGmm1Swiglu()
     { //1C1V改法，屏蔽掉其中1个AIV核
-        aiCoreGroupNum = AscendC::GetBlockNum(); // 这个不动
-        subBlockNum = AscendC::GetSubBlockNum();// 
-        aiCoreGroupIdx = AscendC::GetBlockIdx() / subBlockNum;
+        aiCoreGroupNum = AscendC::GetBlockNum(); // 这个不动 思路: 将1核屏蔽额一核取出 ，由于getsubblock 返回的是0,1因此取1 在整体的编号上是偶数的，当AIC与AIV比例为1:2时，AIC启动的数量为numBlocks，AIV启动的数量为2 * numBlocks；
+        subBlockNum = AscendC::GetSubBlockNum();// 如果此处是AIV调用 返回2 ，AIC调用返回1
+        aiCoreGroupIdx = AscendC::GetBlockIdx() / subBlockNum; // 因为是同时启动AIC和AIV，且比例为1:2,如果是AIC调用 返回[0,numblocks），AIV则右端翻倍 返回值是int64 分母也是int64 因此结果是int64
         subBlockNum = 1;// 骗
         aicNum = aiCoreGroupNum;
-        aivNum = aiCoreGroupNum * SUB_AIV_NUM;  // 1C2V
+        aivNum = aiCoreGroupNum * SUB_AIV_NUM;  // 1C2V -> 1C1V  
         //识别cube和vector 取id
         if ASCEND_IS_AIV {
             // 核心修改 1：移除 return，用 isActiveAiv 标记 SubBlock 0
-            isActiveAiv = (AscendC::GetSubBlockIdx() == 0);
+            isActiveAiv = (AscendC::GetSubBlockIdx() == 0);//取每个block内的第一个AIV
             if (isActiveAiv) {
-                aivIdx = aiCoreGroupIdx;
+                aivIdx = aiCoreGroupIdx;// 除以2后得到的是当前AIV的全局编号，
             }
         }
         if ASCEND_IS_AIC {
@@ -262,7 +263,7 @@ public:
         statusDataSpaceGm = Mc2Kernel::GetStatusDataSpaceGm(winContext_);// 从当前通信群组中获取数据状态同步区的基址
         // 
         if ASCEND_IS_AIV {
-            // 核心修改 2：只有激活的核才去接管业务变量
+            // 只有激活的核才去接管业务变量
             if (isActiveAiv) {
                 compCoreNum = aiCoreGroupNum;
                 isCompCore = true;
@@ -329,22 +330,23 @@ public:
 
     CATLASS_DEVICE
     void NotifySharedX2Ready(uint32_t groupIdx, uint32_t counterIndex)
-    
+    // 第二个参数是 专家状态信息的编号个数 用于做进一步的偏移
     {
         AscendC::GlobalTensor<int32_t> readyTensor;
         readyTensor.SetGlobalBuffer((__gm__ int32_t *)(statusDataSpaceGm + GROUP_TOKEN_NUM_OFFSET) +
-                                    groupIdx * GROUP_INFO_SIZE + counterIndex);
-        AscendC::LocalTensor<int32_t> notifyLocalTensor = resource.ubBuf.template GetBufferByByte<int32_t>(0);
-        AscendC::Duplicate(notifyLocalTensor, static_cast<int32_t>(0), INT32_COUNT_PER_BLOCK);
-        AscendC::SetFlag<AscendC::HardEvent::V_S>(0);
-        AscendC::WaitFlag<AscendC::HardEvent::V_S>(0);
-        notifyLocalTensor.SetValue(0, 1);//修改：
+                                    groupIdx * GROUP_INFO_SIZE + counterIndex);// 取地址
+        AscendC::LocalTensor<int32_t> notifyLocalTensor = resource.ubBuf.template GetBufferByByte<int32_t>(0);//由于该notify的调用是在处理完一切后，不怕数据的污染 因此可以从0位开始
+        AscendC::Duplicate(notifyLocalTensor, static_cast<int32_t>(0), INT32_COUNT_PER_BLOCK);//复制0 取8个int32 对应32字节 作为后续datacopy使用的track 一个int32 4字节 1字节 8bit 一共 4*8 bit = 32 bit 2^32 且为有符号整数
+        AscendC::SetFlag<AscendC::HardEvent::V_S>(0);//
+        AscendC::WaitFlag<AscendC::HardEvent::V_S>(0);//
+        notifyLocalTensor.SetValue(0, 1);//修改：//此处使用scalar 因此 前面是 V_s 落地后再修改
         AscendC::SetFlag<AscendC::HardEvent::S_MTE3>(0);
         AscendC::WaitFlag<AscendC::HardEvent::S_MTE3>(0);
-        AscendC::SetAtomicAdd<int32_t>();
-        AscendC::DataCopy(readyTensor, notifyLocalTensor, INT32_COUNT_PER_BLOCK);
-        AscendC::SetAtomicNone();
-        AscendC::PipeBarrier<PIPE_MTE3>();
+        AscendC::SetAtomicAdd<int32_t>();//开启原子累加模式，使得落在同一个地址的数字反复累加进行状态统计 为什么会落在同一个地区呢？：因为不同的核可能处理同一个专家的任务
+        AscendC::DataCopy(readyTensor, notifyLocalTensor, INT32_COUNT_PER_BLOCK);// 做数据搬运 开启了累加模式后进行搬运，为什么不怕和原来的脏数据累加？
+                                                                                 //：这是因为后续关闭的不会影响当前的，从任务队列去理解，当前的datacopy进入任务队列后，已经做好原子加的计划了，因此取消后不影响
+        AscendC::SetAtomicNone();// 完成数据累加（在原有的位置上）关闭该模式 指令并行 不浪费原子加的时间 。
+        AscendC::PipeBarrier<PIPE_MTE3>();//为什么不是先pipebarrier 再关闭 而是先关闭再pipebarrier
     }
 
     CATLASS_DEVICE
@@ -1114,8 +1116,8 @@ public:
         float sumOfFlag = static_cast<float>(-1.0);
         float minTarget = (sumTarget * recStatusNumPerCore) - (float)0.5;
         float maxTarget = (sumTarget * recStatusNumPerCore) + (float)0.5;
-        AscendC::DataCopyParams intriParams{static_cast<uint16_t>(recStatusNumPerCore), 1, static_cast<uint16_t>(15),
-                                            0};
+        AscendC::DataCopyParams intriParams{static_cast<uint16_t>(recStatusNumPerCore), 1,
+                                            static_cast<uint16_t>((expertCntUp > 512) ? 7 : 15), 0};
         AscendC::GlobalTensor<float> windowInstatusFp32Tensor_;
         windowInstatusFp32Tensor_.SetGlobalBuffer((__gm__ float *)GetWindStateAddrByRankId(epRankId));
         AscendC::SetFlag<AscendC::HardEvent::S_V>(0);
@@ -1334,7 +1336,12 @@ public:
 
             uint32_t newRecvCoreIdx = (recvCoreIdx + recvCoreNum - startCoreIdx) % recvCoreNum;
             uint32_t startTokenIdx = newRecvCoreIdx * recvTokenPerCore;
-             
+            if (newRecvCoreIdx < remainToken) {
+                recvTokenPerCore += 1;
+                startTokenIdx += newRecvCoreIdx;
+            } else {
+                startTokenIdx += remainToken;
+            }
             uint32_t endTokenIdx = startTokenIdx + recvTokenPerCore;
             uint32_t coreTokenCount = recvTokenPerCore;
             uint32_t useCoreNum = currentM < recvCoreNum ? currentM : recvCoreNum;
@@ -1511,7 +1518,8 @@ public:
         axisK = params.topK;
         uint32_t maxAxisBs = params.globalBs / epRankSize;
 
-        stateOffset = STATE_OFFSET;
+            stateOffset = (expertCntUp > 512) ? (STATE_OFFSET / 2) : STATE_OFFSET;
+
         expertPerSizeOnWin = maxAxisBs * tokenLength * sizeof(XType);
     }
 
@@ -1523,13 +1531,15 @@ public:
         GM_ADDR statusSpaceGm_ = GetWindStateAddrByRankId(epRankId);
         AscendC::GlobalTensor<int32_t> selfStatusTensor;
         selfStatusTensor.SetGlobalBuffer((__gm__ int32_t *)(statusSpaceGm_ + SELF_STATE_OFFSET));
-        state = FlushAndGetValue<int32_t>(selfStatusTensor, aivIdx * UB_ALIGN);
+        // 与构造函数保持一致：用 realAivIdx 访问状态区，避免 1C1V 下偏移错位
+        uint32_t realAivIdx = aiCoreGroupIdx * 2 + AscendC::GetSubBlockIdx();
+        state = FlushAndGetValue<int32_t>(selfStatusTensor, realAivIdx * UB_ALIGN);
         sumTarget = state == 0 ? 1.0f : 0.0f;
         tokenFlag = state == 0 ? TOKEN_FLAG_1 : TOKEN_FLAG_2;
         if (state == 0) {
-            SetValueAndFlush<int32_t>(selfStatusTensor, aivIdx * UB_ALIGN, 0x3F800000);
+            SetValueAndFlush<int32_t>(selfStatusTensor, realAivIdx * UB_ALIGN, 0x3F800000);
         } else {
-            SetValueAndFlush<int32_t>(selfStatusTensor, aivIdx * UB_ALIGN, 0);
+            SetValueAndFlush<int32_t>(selfStatusTensor, realAivIdx * UB_ALIGN, 0);
         }
     }
 
@@ -1613,7 +1623,7 @@ public:
                               tmpZeroLocalTensor, INT32_COUNT_PER_BLOCK);
         }
         if constexpr (EXEC_FLAG & EXEC_FLAG_DEEP_FUSE) {
-            if (aivIdx == aiCoreGroupNum * subBlockNum - 1) {
+            if (aivIdx == aiCoreGroupNum  - 1) {
                 AscendC::LocalTensor<int32_t> tmpZeroLocalTensor =
                     resource.ubBuf.template GetBufferByByte<int32_t>(512);
                 AscendC::Duplicate(tmpZeroLocalTensor, (int32_t)0, INT32_COUNT_PER_BLOCK);
@@ -1922,7 +1932,7 @@ public:
             }
             AscendC::PipeBarrier<PIPE_ALL>();
             
-            return; // 履行完所有同步义务后，安全退出！
+            return; // 模仿所有同步后，退出
         }
         AivInitParams(params);
         if constexpr (EXEC_FLAG & EXEC_FLAG_DEEP_FUSE) {
