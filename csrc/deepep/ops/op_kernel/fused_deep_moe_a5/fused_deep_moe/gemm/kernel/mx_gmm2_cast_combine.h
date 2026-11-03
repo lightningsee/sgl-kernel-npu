@@ -725,11 +725,17 @@ public:
             // 只让 coreIdx==0 && SubBlockIdx==0 写；会覆盖 output[0] 前 16 字节
             // Python 侧 fused_output.view(torch.int32)[:8] 读回
             if (coreIdx == 0 && AscendC::GetSubBlockIdx() == 0) {
+                constexpr uint32_t DEBUG_COUNT = 8;  // 8 个 int32 = 32 字节
                 AscendC::GlobalTensor<int32_t> debugTensor;
                 debugTensor.SetGlobalBuffer(reinterpret_cast<__gm__ int32_t *>(params.ptrD));
                 AscendC::LocalTensor<int32_t> debugLocal =
                     resource.ubBuf.template GetBufferByByte<int32_t>(0);
-                AscendC::Duplicate(debugLocal, static_cast<int32_t>(0), GMM2::INT32_COUNT_PER_BLOCK);
+                // 1. V 操作：清零
+                AscendC::Duplicate(debugLocal, static_cast<int32_t>(0), DEBUG_COUNT);
+                // 2. V→S flag
+                AscendC::SetFlag<AscendC::HardEvent::V_S>(0);
+                AscendC::WaitFlag<AscendC::HardEvent::V_S>(0);
+                // 3. S 操作：写入调试值
                 debugLocal.SetValue(0, static_cast<int32_t>(AscendC::GetBlockIdx()));
                 debugLocal.SetValue(1, static_cast<int32_t>(AscendC::GetSubBlockIdx()));
                 debugLocal.SetValue(2, static_cast<int32_t>(coreIdx));
@@ -738,9 +744,11 @@ public:
                 debugLocal.SetValue(5, static_cast<int32_t>(AscendC::GetSubBlockNum()));
                 debugLocal.SetValue(6, static_cast<int32_t>(params.expectedAivNum));
                 debugLocal.SetValue(7, static_cast<int32_t>(activeGroupCount));
-                AscendC::SetFlag<AscendC::HardEvent::V_MTE3>(0);
-                AscendC::WaitFlag<AscendC::HardEvent::V_MTE3>(0);
-                AscendC::DataCopy(debugTensor, debugLocal, GMM2::INT32_COUNT_PER_BLOCK);
+                // 4. S→MTE3 flag
+                AscendC::SetFlag<AscendC::HardEvent::S_MTE3>(0);
+                AscendC::WaitFlag<AscendC::HardEvent::S_MTE3>(0);
+                // 5. MTE3 操作：写 8 个 int32 到 GM
+                AscendC::DataCopy(debugTensor, debugLocal, DEBUG_COUNT);
                 AscendC::PipeBarrier<PIPE_MTE3>();
             }
             // ===== DEBUG END =====

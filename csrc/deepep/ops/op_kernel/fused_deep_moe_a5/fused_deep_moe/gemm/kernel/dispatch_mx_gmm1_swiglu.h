@@ -2190,11 +2190,17 @@ public:
         // 只让 aivIdx==0 的激活核写；UpdateAndCleanInfo 在 SyncAll 之后才写，不会覆盖
         // Python 侧 expert_token_nums.view(torch.int32)[:16] 读回
         if (isActiveAiv && aivIdx == 0) {
+            constexpr uint32_t DEBUG_COUNT = 16;  // 16 个 int32 = 64 字节
             AscendC::GlobalTensor<int32_t> debugTensor;
             debugTensor.SetGlobalBuffer(reinterpret_cast<__gm__ int32_t *>(params.gmExpertTokenNums));
             AscendC::LocalTensor<int32_t> debugLocal =
                 resource.ubBuf.template GetBufferByByte<int32_t>(0);
-            AscendC::Duplicate(debugLocal, static_cast<int32_t>(0), INT32_COUNT_PER_BLOCK);
+            // 1. V 操作：清零
+            AscendC::Duplicate(debugLocal, static_cast<int32_t>(0), DEBUG_COUNT);
+            // 2. V→S flag：等 Duplicate 完成后才能 SetValue
+            AscendC::SetFlag<AscendC::HardEvent::V_S>(0);
+            AscendC::WaitFlag<AscendC::HardEvent::V_S>(0);
+            // 3. S 操作：写入调试值
             debugLocal.SetValue(0, static_cast<int32_t>(AscendC::GetBlockIdx()));
             debugLocal.SetValue(1, static_cast<int32_t>(AscendC::GetSubBlockIdx()));
             debugLocal.SetValue(2, static_cast<int32_t>(aiCoreGroupNum));
@@ -2211,9 +2217,11 @@ public:
             debugLocal.SetValue(13, static_cast<int32_t>(AscendC::GetSubBlockNum()));
             debugLocal.SetValue(14, static_cast<int32_t>(activeGroupCount));
             debugLocal.SetValue(15, static_cast<int32_t>(sparseFastPath ? 1 : 0));
-            AscendC::SetFlag<AscendC::HardEvent::V_MTE3>(0);
-            AscendC::WaitFlag<AscendC::HardEvent::V_MTE3>(0);
-            AscendC::DataCopy(debugTensor, debugLocal, INT32_COUNT_PER_BLOCK);
+            // 4. S→MTE3 flag：等 SetValue 完成后才能 DataCopy
+            AscendC::SetFlag<AscendC::HardEvent::S_MTE3>(0);
+            AscendC::WaitFlag<AscendC::HardEvent::S_MTE3>(0);
+            // 5. MTE3 操作：写 16 个 int32 到 GM
+            AscendC::DataCopy(debugTensor, debugLocal, DEBUG_COUNT);
             AscendC::PipeBarrier<PIPE_MTE3>();
         }
         // ===== DEBUG END =====
