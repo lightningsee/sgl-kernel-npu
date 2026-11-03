@@ -314,9 +314,9 @@ def test(
     # ----- Tokens per rank -----
     experts_per_rank = num_experts // num_ranks
     expert_ranks = topk_idx // experts_per_rank
-    tokens_per_rank = torch.bincount(
-        expert_ranks.reshape(-1), minlength=num_ranks
-    ).to(torch.int64)
+    tokens_per_rank = torch.bincount(expert_ranks.reshape(-1), minlength=num_ranks).to(
+        torch.int64
+    )
 
     if args.debug:
         print(f"[DEBUG] Tokens per rank: {tokens_per_rank}", flush=True)
@@ -383,9 +383,9 @@ def test(
 
     # Expert meta
     valid_expert_ids = topk_idx_dropped[topk_idx_dropped >= 0].reshape(-1)
-    num_tokens_per_expert = torch.bincount(
-        valid_expert_ids, minlength=num_experts
-    ).to(torch.int)
+    num_tokens_per_expert = torch.bincount(valid_expert_ids, minlength=num_experts).to(
+        torch.int
+    )
     gbl_num_tokens_per_expert = num_tokens_per_expert.clone()
     dist.all_reduce(gbl_num_tokens_per_expert, group=group)
 

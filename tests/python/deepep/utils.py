@@ -1,3 +1,4 @@
+import argparse
 import inspect
 import json
 import os
@@ -5,7 +6,7 @@ import sys
 import tempfile
 import uuid
 from pathlib import Path
-from typing import Optional, Union
+from typing import Dict, Optional, Tuple, Union
 
 import numpy as np
 import torch
@@ -237,6 +238,167 @@ def get_diff_threshold(quant_type):
     if "fp8" in quant_type:
         return DIFF_THRESHOLDS["fp8"]
     return DIFF_THRESHOLDS["bf16"]
+
+
+MX_QUANT_MODE_NAMES = ("fp8_e4m3", "fp8_e5m2", "fp4_e2m1")
+# In torch_npu/op-plugin npu_moe_distribute_dispatch_v2, quant_mode=4 selects
+# the generic MX branch; y_dtype determines the actual MX output format.
+# Keep dtype names as strings so importing this module does not require MX dtypes.
+_MX_QUANT_META = {
+    "fp8_e4m3": {
+        "dispatch_y_dtype": "torch.float8_e4m3fn",
+        "quant_dst_type": "torch.float8_e4m3fn",
+        "origin_dtype": "torch.float8_e4m3fn",
+    },
+    "fp8_e5m2": {
+        "dispatch_y_dtype": "torch.float8_e5m2",
+        "quant_dst_type": "torch.float8_e5m2",
+        "origin_dtype": "torch.float8_e5m2",
+    },
+    "fp4_e2m1": {
+        "dispatch_y_dtype": "torch_npu.float4_e2m1fn_x2",
+        "quant_dst_type": "torch_npu.float4_e2m1fn_x2",
+        "origin_dtype": "torch.float4_e2m1fn_x2",
+    },
+}
+
+
+def get_mx_quant_config(quant_name: str) -> Dict[str, object]:
+    config = {"dispatch_quant_mode": 4}
+    for key, dtype_path in _MX_QUANT_META[quant_name].items():
+        module_name, attribute_name = dtype_path.split(".", 1)
+        module = torch if module_name == "torch" else torch_npu
+        config[key] = getattr(module, attribute_name)
+    return config
+
+
+def fused_situ_reference(
+    x: torch.Tensor, beta: Optional[float], linear_beta: Optional[float]
+) -> torch.Tensor:
+    # GMM1 already returns the input dtype, matching the fused epilogue's
+    # half-precision rounding. Compute both branches and their product in FP32,
+    # then round once before MX quantization.
+    gate, up = x.float().chunk(2, dim=-1)
+    beta = 4.0 if beta is None else beta
+    # Follow the kernel's multiply-by-reciprocal and Exp/Add/Div order.
+    # Multiplying by sigmoid is algebraically equivalent, but has different
+    # FP32 rounding before BF16 and MX quantization.
+    gate_out = beta * torch.tanh(gate * (1.0 / beta))
+    gate_out = gate_out / (torch.exp(-gate) + 1.0)
+    if linear_beta is not None:
+        up = linear_beta * torch.tanh(up * (1.0 / linear_beta))
+    return (gate_out * up).to(x.dtype)
+
+
+def run_small_op_baseline(
+    inputs: Dict[str, torch.Tensor],
+    hcomm_name: str,
+    rank: int,
+    world_size: int,
+    global_bs: int,
+    args: argparse.Namespace,
+    gmm_burn_in_repeats: int = 1,
+    warmup_burn_in_buffers: Tuple[torch.Tensor, torch.Tensor] = None,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    quant_cfg = get_mx_quant_config(args.quant)
+    output_dtype = inputs["x"].dtype
+
+    outputs = torch_npu.npu_moe_distribute_dispatch_v2(
+        x=inputs["x"],
+        expert_ids=inputs["expert_ids"],
+        expert_scales=inputs["expert_scales"],
+        scales=None,
+        x_active_mask=inputs["x_active_mask"],
+        group_ep=hcomm_name,
+        ep_world_size=world_size,
+        ep_rank_id=rank,
+        moe_expert_num=args.num_experts,
+        group_tp="",
+        tp_world_size=1,
+        tp_rank_id=0,
+        expert_shard_type=0,
+        shared_expert_num=1,
+        shared_expert_rank_num=0,
+        quant_mode=quant_cfg["dispatch_quant_mode"],
+        global_bs=global_bs,
+        expert_token_nums_type=1,
+        y_dtype=quant_cfg["dispatch_y_dtype"],
+    )
+    (
+        expand_x,
+        dynamic_scales,
+        assist_info_for_combine,
+        expert_token_nums,
+        ep_send_counts,
+        tp_send_counts,
+        expand_scales,
+    ) = outputs
+
+    if gmm_burn_in_repeats > 1 and warmup_burn_in_buffers is not None:
+        # This burn-in only runs on the first profiler warmup iteration.
+        # It does not change the routed output; it only inserts extra device
+        # work before the normal small-op chain of that warmup iteration.
+        burn_in_lhs, burn_in_rhs = warmup_burn_in_buffers
+        for _ in range(gmm_burn_in_repeats):
+            _ = torch.matmul(burn_in_lhs, burn_in_rhs)
+
+    dynamic_scales = dynamic_scales.view(*(dynamic_scales.shape[:-1]), -1, 2).view(
+        torch.float8_e8m0fnu
+    )
+    y1_fp = torch_npu.npu_grouped_matmul(
+        x=[expand_x],
+        weight=[inputs["gmm1_weight_q"]],
+        scale=[inputs["gmm1_weight_scale"]],
+        per_token_scale=[dynamic_scales],
+        split_item=2,
+        group_list_type=1,
+        group_type=0,
+        group_list=expert_token_nums,
+        output_dtype=output_dtype,
+    )[0]
+    if args.activation == "situ":
+        activation_out = fused_situ_reference(y1_fp, args.beta, args.linear_beta)
+    else:
+        activation_out = torch_npu.npu_swiglu(y1_fp)
+    x2, x2_scale = torch_npu.npu_dynamic_mx_quant(
+        activation_out, dst_type=quant_cfg["quant_dst_type"]
+    )
+    x2 = x2.view(quant_cfg["origin_dtype"])
+
+    x2_scale = x2_scale.view(torch.float8_e8m0fnu)
+    y2_fp = torch_npu.npu_grouped_matmul(
+        x=[x2],
+        weight=[inputs["gmm2_weight_q"]],
+        scale=[inputs["gmm2_weight_scale"]],
+        per_token_scale=[x2_scale],
+        split_item=2,
+        group_list_type=1,
+        group_type=0,
+        group_list=expert_token_nums,
+        output_dtype=output_dtype,
+    )[0]
+    output = torch_npu.npu_moe_distribute_combine_v2(
+        expand_x=y2_fp,
+        expert_ids=inputs["expert_ids"],
+        assist_info_for_combine=assist_info_for_combine,
+        ep_send_counts=ep_send_counts,
+        expert_scales=inputs["expert_scales"],
+        x_active_mask=inputs["x_active_mask"],
+        group_ep=hcomm_name,
+        ep_world_size=world_size,
+        ep_rank_id=rank,
+        moe_expert_num=args.num_experts,
+        tp_send_counts=tp_send_counts,
+        expand_scales=expand_scales,
+        group_tp="",
+        tp_world_size=1,
+        tp_rank_id=0,
+        expert_shard_type=0,
+        shared_expert_num=1,
+        shared_expert_rank_num=0,
+        global_bs=global_bs,
+    )
+    return output, expert_token_nums.to(torch.int32)
 
 
 class empty_suppress:
