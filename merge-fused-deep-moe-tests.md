@@ -194,3 +194,37 @@ python3 tests/python/deepep/test_fused_deep_moe.py \
 | `utils.py` 可独立导入 | 模拟 `torch_npu` 缺少 `float4_e2m1fn_x2` | `import utils` 不报错，A3 的 `init_base_weights` 可调用 |
 | CI 通过 | `pr-test-deepep-npu.yml` 全量 | A3/A5 两条命令均通过 |
 | 测试覆盖不减少 | 对比合并前后的参数组合和执行路径 | 默认参数、随机种子、精度阈值、profile case 校验均保留 |
+
+
+
+  ### 按算子方案的优缺点
+
+  • 优点:改动聚焦 FusedDeepMoe,DFC/MegaMoe 只做 import 微调;A3/A5 同算子共处一文件,公共行为改一处;commit
+  拆分粒度细,前两步可独立回滚。
+  • 缺点:跨平台共享(run_small_op_baseline)要外迁 utils.py 桥接,MegaMoe 依赖延迟 import(L1526);--quant 切平台不如 --op
+  显式;A5 DFC 无归宿(本方案不处理)。
+
+  1. 改动面小、风险可控:只合并 FusedDeepMoe 的 A3/A5,删除 1 个旧文件(test_fused_deep_moe_a5.py);DFC 和 MegaMoe
+  基本不动,只在 import 上微调。按平台方案要新建 2 个文件、删除 4 个旧文件、搬运 DFC/MegaMoe 全部代码。
+  2. commit 拆分细、可分步回滚:前 2 个 commit 是单文件精简(仅 test_fused_deep_moe.py / test_fused_deep_moe_a5.py),第 3
+  个迁 utils.py,第 4 个才合并入口。每步只触碰各自文件,任一步发现问题都能独立回退,不影响前序成果。按平台方案几乎每个
+  commit 都横跨多算子搬运,review 压力集中。
+  3. 同算子的 A3/A5 共处一文件:FusedDeepMoe 的公共行为(精度阈值、profile 校验、计数断言、profiler
+  事件约定)改一处即可,两套路径天然对照。按平台方案下 A3/A5 同算子分居两文件,改公共行为要同步两边,容易漂移。
+  4. DFC/MegaMoe
+  保持原结构:这两个算子各有独立的通信组、Buffer、权重路径和性能统计口径,保持独立文件维护边界清晰。按平台方案强行把
+  DFC(MegaMoe)和 FusedDeepMoe 塞进同一文件,会引入重名函数改名(test/test_loop/baseline_test)和 spawn 调用链调整。
+  5. 不制造空壳入口:A5 DFC 底层未适配,按算子方案不处理它;按平台方案要在 A5
+  文件里放入口并报不支持,文件结构领先于功能,后续若 A5 DFC 不落地就是死代码。
+  6. 跨平台共享代码外迁 utils.py 更通用:run_small_op_baseline、get_mx_quant_config、fused_situ_reference 迁到 utils.py
+  后,FusedDeepMoe 和 MegaMoe 都从工具模块导入,依赖关系是"测试 → 工具",而不是"测试 → 测试"。按平台方案把共享 baseline
+  留在 A5 文件内,MegaMoe 仍依赖 FusedDeepMoe 所在文件,耦合方向不干净。
+  7. --quant 复用现有参数语义:A5 本来就有 --quant,只是把 default 从 fp8_e4m3 改成 None 来触发 A3 路径。不增加 --op、--
+  platform 等新维度,用户认知负担小;argparse 的"未注册即拒绝"天然实现跨平台参数互斥。
+  8. MX_QUANT_CONFIGS 拆层有独立价值:层 1(静态字符串表)可安全迁 utils.py 且模块加载时不解析 MXFP dtype,层
+  2(get_mx_quant_config(quant_name))运行时构造 dtype。这个拆分解决了"模块加载时解析 dtype 导致 A3
+  路径无法导入"的隐患,无论是否合并入口都值得做。
+  9. 与现有 CI/脚本兼容性高:A3 命令和 scripts/generalization_test_fused_deep_moe.sh 保持原样,A5 命令只需补 --quant
+  和换路径。按平台方案要按 job 平台替换路径并增加 --op,改动范围更大。
+  10. 适合渐进式推进:你现在的诉求是"只动 FusedDeepMoe 两个文件",按算子方案的前两步(A3/A5 精简)完全满足,后续迁 utils.py
+  和合并入口可视情况再推进。按平台方案是一锤子买卖,必须一次性搬完三个算子才有意义。

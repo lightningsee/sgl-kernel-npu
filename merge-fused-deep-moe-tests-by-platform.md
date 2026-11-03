@@ -142,3 +142,24 @@ dtype 使用时再解析，help 用字符串 choices。`cann_ops_transformer.ops
 python3 tests/python/deepep/test_fused_moe_a3.py --op mega_moe --num-processes 8 --quant-mode w4a8
 python3 tests/python/deepep/test_fused_moe_a5.py --op fused_deep_moe --num-processes 4 --quant fp4_e2m1
 ```
+
+ ### 按平台方案的优点
+
+  1. 同平台的权重/baseline 复用更直接:A3 FusedDeepMoe 与 A3 DFC 共用 init_base_weights/init_baseline_weights(L92),A5
+  FusedDeepMoe 与 A5 MegaMoe 共用 run_small_op_baseline(L96),复用关系落在同一文件内,不需要跨文件 import。
+  2. 设备能力对齐:A5 DFC 底层未适配,文件内直接报不支持(L75、L98),入口与设备匹配关系清晰;按算子方案下 A5 DFC 没有归宿。
+  3. --op 语义比 --quant 切平台更直观:文件名=平台,--op=算子,维度正交;按算子方案用 --quant
+  是否传值隐式判断平台,语义稍隐晦。
+  4. MegaMoe 的 import 局部化:cann_ops_transformer、JIT 依赖只在 MegaMoe 路径加载(L100),A5 文件内 FusedDeepMoe 不跑
+  MegaMoe 时不会触发这些依赖,天然隔离。
+
+  ### 按平台方案的缺点
+
+  1. 改动面更大:要新建 2 个文件、删除 4 个旧文件(L27),DFC 和 MegaMoe 都要搬;按算子方案只删 1 个 A5 文件,DFC/MegaMoe
+  基本不动。
+  2. A3/A5 同算子的代码分居两文件:FusedDeepMoe 的 A3 版和 A5 版差异大(权重 dtype、quant 路径、profile
+  逻辑),分别维护后,改一个算子的公共行为要同步两个文件,容易漂移。
+  3. 重名函数改名成本:test/test_loop/baseline_test 要改成算子区分名(L31),worker 顶层重命名涉及 spawn 调用链。
+  4. A5 DFC 是空头支票:现在没适配,L75 只是占位,先建文件再等底层,文件结构领先于功能。
+  5. commit 拆分更重:按算子方案 4 个 commit 里前 2 个是单文件精简;按平台方案几乎每个 commit 都横跨多个算子的搬运,review
+  压力集中。

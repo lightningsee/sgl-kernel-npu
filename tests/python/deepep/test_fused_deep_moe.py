@@ -1,15 +1,13 @@
 import argparse
 import os
 import random
-import sys
-import time
-from functools import partial
+
 
 import torch
 import torch.distributed as dist
 import torch_npu
 from deep_ep import Buffer
-from utils import bench_kineto, calc_diff, hash_tensor, init_dist
+from utils import bench_kineto, calc_diff, init_dist
 
 torch_npu.npu.config.allow_internal_format = True
 
@@ -119,36 +117,6 @@ def init_fused_weights_int8(
     return w13_int8_nz, w13_scale_o, w2_int8_nz, w2_scale_o
 
 
-# ======================== Utility Functions ========================
-def make_uniform_topk_idx(
-    num_tokens: int, num_experts: int, num_ranks: int, num_topk: int, device="npu"
-):
-    assert num_experts % num_ranks == 0, "num_experts must be divisible by num_ranks"
-    experts_per_rank = num_experts // num_ranks
-
-    topk_idx = torch.full((num_tokens, num_topk), -1, dtype=torch.int64, device=device)
-
-    for t in range(num_tokens):
-        for k in range(num_topk):
-            rank_id = (t * num_topk + k) % num_ranks
-            expert_base = rank_id * experts_per_rank
-            expert_id = expert_base + ((t + k) % experts_per_rank)
-            topk_idx[t, k] = expert_id
-    return topk_idx
-
-
-def from_inclusive_prefix_sum(pref):
-    if isinstance(pref, torch.Tensor):
-        if pref.numel() == 0:
-            return pref
-        return torch.cat([pref[:1], pref[1:] - pref[:-1]])
-
-    if not pref:
-        return []
-    out = [pref[0]]
-    for i in range(1, len(pref)):
-        out.append(pref[i] - pref[i - 1])
-    return out
 
 
 # ======================== Baseline Reference ========================
@@ -627,13 +595,7 @@ def test_loop(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
     dist.destroy_process_group()
 
 
-def str_to_bool(value):
-    if isinstance(value, bool):
-        return value
-    if value.lower() in ("true", "True", "1"):
-        return True
-    else:
-        return False
+
 
 
 if __name__ == "__main__":
