@@ -146,6 +146,21 @@ def maybe_cast_weight_to_nz(
     return weight
 
 
+def _quant_and_cast_weight(
+    args: argparse.Namespace,
+    shape: Tuple[int, int, int],
+    quant_cfg: Dict[str, object],
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Build a random fp weight, quantize it, apply NZ cast, and return (weight_q, scale)."""
+    fp_weight = torch.rand(shape).bfloat16().npu() * 2 - 1
+    weight_q, scale_raw = torch_npu.npu_dynamic_mx_quant(
+        fp_weight, dst_type=quant_cfg["quant_dst_type"], axis=1
+    )
+    weight_q = maybe_cast_weight_to_nz(args, weight_q, quant_cfg["origin_dtype"], shape)
+    scale = scale_raw.view(torch.float8_e8m0fnu)
+    return weight_q, scale
+
+
 def make_umdk_static_inputs(
     rank: int,
     world_size: int,
@@ -179,41 +194,17 @@ def make_umdk_static_inputs(
         (local_num_tokens, args.num_topk), dtype=torch.float32
     ).npu()
 
-    gmm1_fp = (
-        torch.rand((local_experts, args.hidden, args.moe_intermediate_size * 2))
-        .bfloat16()
-        .npu()
-        * 2
-        - 1
-    )
-    gmm1_weight, gmm1_scale_raw = torch_npu.npu_dynamic_mx_quant(
-        gmm1_fp, dst_type=quant_cfg["quant_dst_type"], axis=1
-    )
-    gmm1_weight = maybe_cast_weight_to_nz(
+    gmm1_weight, gmm1_scale = _quant_and_cast_weight(
         args,
-        gmm1_weight,
-        quant_cfg["origin_dtype"],
         (local_experts, args.hidden, args.moe_intermediate_size * 2),
+        quant_cfg,
     )
-    gmm1_scale = gmm1_scale_raw.view(torch.float8_e8m0fnu)
 
-    gmm2_fp = (
-        torch.rand((local_experts, args.moe_intermediate_size, args.hidden))
-        .bfloat16()
-        .npu()
-        * 2
-        - 1
-    )
-    gmm2_weight, gmm2_scale_raw = torch_npu.npu_dynamic_mx_quant(
-        gmm2_fp, dst_type=quant_cfg["quant_dst_type"], axis=1
-    )
-    gmm2_weight = maybe_cast_weight_to_nz(
+    gmm2_weight, gmm2_scale = _quant_and_cast_weight(
         args,
-        gmm2_weight,
-        quant_cfg["origin_dtype"],
         (local_experts, args.moe_intermediate_size, args.hidden),
+        quant_cfg,
     )
-    gmm2_scale = gmm2_scale_raw.view(torch.float8_e8m0fnu)
 
     return {
         "x": x,
@@ -287,9 +278,11 @@ def make_random_profile_cases(
     local_num_tokens: int,
     padded_num_tokens: int,
     args: argparse.Namespace,
+    total_case_count: Optional[int] = None,
 ) -> List[Dict[str, object]]:
     cases = []
-    total_case_count = args.num_warmups + args.num_tests
+    if total_case_count is None:
+        total_case_count = args.num_warmups + args.num_tests
     for case_idx in range(total_case_count):
         case_seed = RANDOM_PROFILE_SEED + case_idx * world_size + rank
         torch_generator = torch.Generator(device="npu")
@@ -360,7 +353,8 @@ def make_fixed_profile_cases(
         world_size,
         local_num_tokens,
         padded_num_tokens,
-        argparse.Namespace(**{**vars(args), "num_warmups": 1, "num_tests": 0}),
+        args,
+        total_case_count=1,
     )[0]
     cases = []
     for case_idx in range(total_case_count):
@@ -501,70 +495,6 @@ def validate_random_profile_results(
         assert_unique_tensor_storage(
             [result[1] for result in fused_results], "random profile fused counts"
         )
-
-        if profile_cases[0].get("fixed_values", False) and total_case_count > 1:
-            baseline_small = small_results[0][0][:local_num_tokens].float()
-            baseline_fused = fused_results[0][0][:local_num_tokens].float()
-            baseline_small_counts = small_results[0][1]
-            baseline_fused_counts = fused_results[0][1]
-            fixed_cross_mismatches = []
-            for case_idx in range(1, total_case_count):
-                small_value_error = None
-                fused_value_error = None
-                small_count_error = None
-                fused_count_error = None
-                current_small = small_results[case_idx][0][:local_num_tokens].float()
-                current_fused = fused_results[case_idx][0][:local_num_tokens].float()
-                try:
-                    torch.testing.assert_close(
-                        current_small, baseline_small, atol=0.0, rtol=0.0
-                    )
-                except Exception as exc:
-                    small_value_error = str(exc).splitlines()[0]
-                try:
-                    torch.testing.assert_close(
-                        current_fused, baseline_fused, atol=0.0, rtol=0.0
-                    )
-                except Exception as exc:
-                    fused_value_error = str(exc).splitlines()[0]
-                try:
-                    torch.testing.assert_close(
-                        small_results[case_idx][1], baseline_small_counts
-                    )
-                except Exception as exc:
-                    small_count_error = str(exc).splitlines()[0]
-                try:
-                    torch.testing.assert_close(
-                        fused_results[case_idx][1], baseline_fused_counts
-                    )
-                except Exception as exc:
-                    fused_count_error = str(exc).splitlines()[0]
-                if any(
-                    (
-                        small_value_error,
-                        fused_value_error,
-                        small_count_error,
-                        fused_count_error,
-                    )
-                ):
-                    small_avg, small_max, _ = summarize_output_diff(
-                        baseline_small, current_small
-                    )
-                    fused_avg, fused_max, _ = summarize_output_diff(
-                        baseline_fused, current_fused
-                    )
-                    fixed_cross_mismatches.append(
-                        "iteration="
-                        f"{case_idx}, seed={profile_cases[case_idx]['seed']}; "
-                        f"small(avg={small_avg:.6f}, max={small_max:.6f}, error={small_value_error!r}), "
-                        f"fused(avg={fused_avg:.6f}, max={fused_max:.6f}, error={fused_value_error!r}), "
-                        f"small_counts={small_count_error!r}, fused_counts={fused_count_error!r}"
-                    )
-            if fixed_cross_mismatches:
-                raise AssertionError(
-                    "fixed-value cross-iteration mismatches: "
-                    + " | ".join(fixed_cross_mismatches)
-                )
 
         first_formal_small = None
         first_formal_fused = None

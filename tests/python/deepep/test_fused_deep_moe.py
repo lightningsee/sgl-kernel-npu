@@ -116,6 +116,28 @@ def init_fused_weights_int8(
     return w13_int8_nz, w13_scale_o, w2_int8_nz, w2_scale_o
 
 
+def prepare_all_weights(num_local_experts, hidden, moe_intermediate_size):
+    """Run the full weight init chain once and return (baseline, fused) tuples."""
+    w13_weight, w13_weight_scale, w2_weight, w2_weight_scale = init_base_weights(
+        num_local_experts=num_local_experts,
+        hidden_in=hidden,
+        moe_intermediate_size=moe_intermediate_size,
+    )
+    baseline_weights = init_baseline_weights(
+        w13_weight.clone().detach(),
+        w13_weight_scale.clone().detach(),
+        w2_weight.clone().detach(),
+        w2_weight_scale.clone().detach(),
+    )
+    fused_weights = init_fused_weights_int8(
+        w13_weight.clone().detach(),
+        w13_weight_scale.clone().detach(),
+        w2_weight.clone().detach(),
+        w2_weight_scale.clone().detach(),
+    )
+    return baseline_weights, fused_weights
+
+
 # ======================== Baseline Reference ========================
 def baseline_test(
     buffer,
@@ -278,22 +300,8 @@ def test(
         topk_idx = torch.topk(scores, num_topk, dim=-1, largest=True, sorted=True)[1]
 
     # ----- Weights -----
-    w13_weight, w13_weight_scale, w2_weight, w2_weight_scale = init_base_weights(
-        num_local_experts=num_local_experts,
-        hidden_in=hidden,
-        moe_intermediate_size=moe_intermediate_size,
-    )
-    w13, w13_scale, w2, w2_scale = init_baseline_weights(
-        w13_weight.clone().detach(),
-        w13_weight_scale.clone().detach(),
-        w2_weight.clone().detach(),
-        w2_weight_scale.clone().detach(),
-    )
-    w13_f, w13s_f, w2_f, w2s_f = init_fused_weights_int8(
-        w13_weight.clone().detach(),
-        w13_weight_scale.clone().detach(),
-        w2_weight.clone().detach(),
-        w2_weight_scale.clone().detach(),
+    (w13, w13_scale, w2, w2_scale), (w13_f, w13s_f, w2_f, w2s_f) = prepare_all_weights(
+        num_local_experts, hidden, moe_intermediate_size
     )
 
     if args.debug and rank == 0:
@@ -304,11 +312,11 @@ def test(
         print("w2s_f:", w2s_f.shape, w2s_f.dtype, w2s_f.device)
 
     # ----- Tokens per rank -----
-    tokens_per_rank = torch.zeros(num_ranks, dtype=torch.int64, device="npu")
     experts_per_rank = num_experts // num_ranks
-    for r in range(num_ranks):
-        start, end = r * experts_per_rank, (r + 1) * experts_per_rank
-        tokens_per_rank[r] = ((topk_idx >= start) & (topk_idx < end)).sum()
+    expert_ranks = topk_idx // experts_per_rank
+    tokens_per_rank = torch.bincount(
+        expert_ranks.reshape(-1), minlength=num_ranks
+    ).to(torch.int64)
 
     if args.debug:
         print(f"[DEBUG] Tokens per rank: {tokens_per_rank}", flush=True)
@@ -374,9 +382,10 @@ def test(
         topk_weights_dropped = topk_weights
 
     # Expert meta
-    num_tokens_per_expert = torch.zeros((num_experts,), dtype=torch.int, device="npu")
-    for i in range(num_experts):
-        num_tokens_per_expert[i] = (topk_idx_dropped == i).sum()
+    valid_expert_ids = topk_idx_dropped[topk_idx_dropped >= 0].reshape(-1)
+    num_tokens_per_expert = torch.bincount(
+        valid_expert_ids, minlength=num_experts
+    ).to(torch.int)
     gbl_num_tokens_per_expert = num_tokens_per_expert.clone()
     dist.all_reduce(gbl_num_tokens_per_expert, group=group)
 
