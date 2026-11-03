@@ -1212,6 +1212,118 @@ def summarize_tensor_stats(tensor: torch.Tensor) -> Tuple[float, float]:
     return tensor_f.abs().max().item(), tensor_f.mean().item()
 
 
+def diagnose_nan(tensor: torch.Tensor, name: str, rank: int = 0) -> dict:
+    """诊断 tensor 中的 NaN/Inf 分布，打印详细信息并返回统计字典。"""
+    if tensor.numel() == 0:
+        print(f"[rank{rank}] {name}: empty tensor, skip NaN diagnosis", flush=True)
+        return {}
+    tensor_f = tensor.float()
+    nan_mask = torch.isnan(tensor_f)
+    inf_mask = torch.isinf(tensor_f)
+    nan_count = nan_mask.sum().item()
+    inf_count = inf_mask.sum().item()
+    total = tensor.numel()
+
+    stats = {
+        "total_elements": total,
+        "nan_count": nan_count,
+        "inf_count": inf_count,
+        "nan_ratio": nan_count / total if total > 0 else 0.0,
+    }
+
+    print(f"[rank{rank}] {name} NaN diagnosis:", flush=True)
+    print(f"  shape={tuple(tensor.shape)}, dtype={tensor.dtype}, total={total}", flush=True)
+    print(f"  NaN: {nan_count} ({stats['nan_ratio']:.4%})", flush=True)
+    print(f"  Inf: {inf_count}", flush=True)
+
+    if tensor.dim() == 2:
+        # 按行统计 NaN
+        nan_per_row = nan_mask.sum(dim=1)
+        nan_rows = (nan_per_row > 0).sum().item()
+        print(f"  rows with NaN: {nan_rows}/{tensor.shape[0]}", flush=True)
+        if nan_rows > 0 and nan_rows <= 20:
+            bad_row_indices = torch.where(nan_per_row > 0)[0].cpu().tolist()
+            for ridx in bad_row_indices:
+                nan_cols = torch.where(nan_mask[ridx])[0].cpu().tolist()
+                print(f"    row {ridx}: {len(nan_cols)} NaN cols, "
+                      f"first 10 cols={nan_cols[:10]}", flush=True)
+        elif nan_rows > 20:
+            # 全 NaN 还是部分行
+            all_nan_rows = (nan_per_row == tensor.shape[1]).sum().item()
+            print(f"  fully-NaN rows: {all_nan_rows}/{tensor.shape[0]}", flush=True)
+
+        # 按列统计 NaN
+        nan_per_col = nan_mask.sum(dim=0)
+        nan_cols = (nan_per_col > 0).sum().item()
+        print(f"  cols with NaN: {nan_cols}/{tensor.shape[1]}", flush=True)
+        if nan_cols > 0 and nan_cols <= 20:
+            bad_col_indices = torch.where(nan_per_col > 0)[0].cpu().tolist()
+            print(f"    NaN col indices (first 10): {bad_col_indices[:10]}", flush=True)
+    elif tensor.dim() == 1:
+        nan_indices = torch.where(nan_mask)[0].cpu().tolist()
+        print(f"  NaN indices (first 20): {nan_indices[:20]}", flush=True)
+
+    # 非 NaN 值的统计
+    valid = tensor_f[~nan_mask & ~inf_mask]
+    if valid.numel() > 0:
+        print(f"  valid values: min={valid.min().item():.6f}, "
+              f"max={valid.max().item():.6f}, mean={valid.mean().item():.6f}", flush=True)
+    else:
+        print(f"  ALL values are NaN/Inf!", flush=True)
+
+    return stats
+
+
+def read_debug_zone(output: torch.Tensor, num_debug_rows: int = 4,
+                    ints_per_row: int = None) -> torch.Tensor:
+    """从 output tensor 的最后 num_debug_rows 行读回 kernel 写入的调试值。
+
+    kernel 侧把调试 int32 值写到 output 最后几行（view 为 int32）。
+    Python 侧读回时，bfloat16 每 2 字节对应 1 个 int32，所以 ints_per_row = hidden // 2。
+    """
+    if ints_per_row is None:
+        # bfloat16 是 2 字节，int32 是 4 字节，所以每行 hidden 个 bf16 = hidden/2 个 int32
+        ints_per_row = output.shape[1] // 2
+    debug_zone = output[-num_debug_rows:].view(torch.int32).cpu()
+    print(f"[DEBUG ZONE] Reading {num_debug_rows} rows x {ints_per_row} int32 "
+          f"from output tail:", flush=True)
+    for row in range(num_debug_rows):
+        vals = debug_zone[row].tolist()
+        print(f"  debug_row[{row}]: {vals[:16]}{'...' if len(vals) > 16 else ''}", flush=True)
+    return debug_zone
+
+
+def read_gmm1_debug(expert_token_nums: torch.Tensor, rank: int = 0):
+    """从 expert_token_nums 读回 GMM1 kernel 写入的调试值。
+
+    GMM1 kernel 把 16 个 int32 写到 expert_token_nums 的前 32 字节。
+    expert_token_nums 是 int64，view 为 int32 后读前 16 个。
+    """
+    # expert_token_nums 可能是 int32 或 int64，统一 view 为 int32
+    debug_vals = expert_token_nums.view(torch.int32)[:16].cpu().tolist()
+    labels = [
+        "blockIdx", "subBlockIdx", "aiCoreGroupNum", "aiCoreGroupIdx",
+        "aicNum", "aivNum", "isActiveAiv", "isRecvCore",
+        "isSendCore", "recvCoreNum", "sendCoreNum", "compCoreNum",
+        "blockNum", "subBlockNum", "activeGroupCount", "sparseFastPath",
+    ]
+    print(f"\n[rank{rank}] GMM1 DEBUG (from expert_token_nums):", flush=True)
+    for i, (label, val) in enumerate(zip(labels, debug_vals)):
+        print(f"  [{i:2d}] {label:20s} = {val}", flush=True)
+
+
+def read_gmm2_debug(output: torch.Tensor, rank: int = 0):
+    """从 output[0] 前 8 个 int32 读回 GMM2 kernel 写入的调试值。"""
+    debug_vals = output.view(torch.int32)[:8].cpu().tolist()
+    labels = [
+        "blockIdx", "subBlockIdx", "coreIdx", "coreNum",
+        "blockNum", "subBlockNum", "expectedAivNum", "activeGroupCount",
+    ]
+    print(f"\n[rank{rank}] GMM2 DEBUG (from output[0]):", flush=True)
+    for i, (label, val) in enumerate(zip(labels, debug_vals)):
+        print(f"  [{i:2d}] {label:20s} = {val}", flush=True)
+
+
 def get_uniform_expected_counts(
     total_num_tokens: int,
     num_topk: int,
@@ -1398,6 +1510,33 @@ def run_rank(local_rank: int, num_processes: int, args: argparse.Namespace):
         assert fused_counts.shape == (local_experts,)
         valid_small_output = small_output[:local_num_tokens]
         valid_fused_output = fused_output[:local_num_tokens]
+
+        # NaN 诊断：在断言前打印详细 NaN 分布
+        small_nan = torch.isnan(valid_small_output.float()).sum().item()
+        fused_nan = torch.isnan(valid_fused_output.float()).sum().item()
+        if small_nan > 0 or fused_nan > 0:
+            print(f"\n[rank{rank}] !!! NaN detected before assertion !!!", flush=True)
+            print(f"[rank{rank}] small_nan={small_nan}, fused_nan={fused_nan}", flush=True)
+            if small_nan > 0:
+                diagnose_nan(valid_small_output, "valid_small_output", rank)
+            if fused_nan > 0:
+                diagnose_nan(valid_fused_output, "valid_fused_output", rank)
+                # 读 kernel 调试值
+                try:
+                    read_gmm1_debug(fused_counts, rank)
+                    read_gmm2_debug(fused_output, rank)
+                except Exception as e:
+                    print(f"[rank{rank}] Failed to read debug zone: {e}", flush=True)
+            print(f"[rank{rank}] !!! End NaN diagnosis !!!\n", flush=True)
+
+        # 正常无 NaN 时也读一次调试值（验证核心数是否正确）
+        if fused_nan == 0:
+            try:
+                read_gmm1_debug(fused_counts, rank)
+                read_gmm2_debug(fused_output, rank)
+            except Exception as e:
+                print(f"[rank{rank}] Failed to read debug (no NaN): {e}", flush=True)
+
         assert torch.isnan(valid_small_output).sum().item() == 0
         assert torch.isnan(valid_fused_output).sum().item() == 0
 

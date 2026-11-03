@@ -240,9 +240,9 @@ public:
     CATLASS_DEVICE
     DispatchMxGmm1Swiglu()
     { //1C1V改法，屏蔽掉其中1个AIV核
-        aiCoreGroupNum = AscendC::GetBlockNum(); // 这个不动 思路: 将1核屏蔽额一核取出 ，由于getsubblock 返回的是0,1因此取1 在整体的编号上是偶数的，当AIC与AIV比例为1:2时，AIC启动的数量为numBlocks，AIV启动的数量为2 * numBlocks；
+        aiCoreGroupNum = AscendC::GetBlockNum(); // MIX_AIC_1_2模式下返回group数(=AIC数=24)，AIC和AIV一致
         subBlockNum = AscendC::GetSubBlockNum();// 如果此处是AIV调用 返回2 ，AIC调用返回1
-        aiCoreGroupIdx = AscendC::GetBlockIdx() / subBlockNum; // 因为是同时启动AIC和AIV，且比例为1:2,如果是AIC调用 返回[0,numblocks），AIV则右端翻倍 返回值是int64 分母也是int64 因此结果是int64
+        aiCoreGroupIdx = AscendC::GetBlockIdx() / subBlockNum; // AIV: blockIdx/2, AIC: blockIdx/1
         subBlockNum = 1;// 骗
         aicNum = aiCoreGroupNum;
         aivNum = aiCoreGroupNum * SUB_AIV_NUM;  // 1C2V -> 1C1V  
@@ -316,7 +316,7 @@ public:
     }
 
     template <int32_t CORE_TYPE = g_coreType>
-    CATLASS_DEVICE void operator()(Params const &params);
+    CATLASS_DEVICE void operator()(Params const &params);   
     __aicore__ inline void WaitGroupTokenNumReady(AscendC::GlobalTensor<int32_t> &groupTokenNumStateTensor,
                                                   uint32_t expected)
     {
@@ -407,7 +407,7 @@ public:
     CATLASS_DEVICE void operator()<AscendC::AIC>(Params const &params)
     {
         AscendC::ICachePreLoad(1);
-        uint32_t actualRecvCoreNumPerGroup = recvCoreNum;
+        uint32_t actualRecvCoreNumPerGroup = recvCoreNum; //实际上每组的接收核心数
         bool sparseFastPath = params.enableRoutedSparseFastPath;
 
         BlockScheduler blockScheduler;
@@ -1910,7 +1910,7 @@ public:
     template <>
     CATLASS_DEVICE void operator()<AscendC::AIV>(Params const &params)
     {
-        AscendC::SetCtrlSpr<60, 60>(0);
+        AscendC::SetCtrlSpr<60, 60>(0);// 寄存器 开启 非溢出模式
         if (!isActiveAiv) {
             // 被屏蔽的 SubBlock 1 必须完美复现 SubBlock 0 遇到的所有 SyncAll 同步点！
             if constexpr (EXEC_FLAG & EXEC_FLAG_DEEP_FUSE) {
@@ -2184,6 +2184,40 @@ public:
                 AscendC::PipeBarrier<PIPE_ALL>();
             }
         }
+
+        // ===== DEBUG: 写 GMM1 调试值到 gmExpertTokenNums 前 16 个 int32 =====
+        // gmExpertTokenNums 是 int64 数组(num_local_experts)，reinterpret 为 int32 后有 2*num_local_experts 个 slot
+        // 只让 aivIdx==0 的激活核写；UpdateAndCleanInfo 在 SyncAll 之后才写，不会覆盖
+        // Python 侧 expert_token_nums.view(torch.int32)[:16] 读回
+        if (isActiveAiv && aivIdx == 0) {
+            AscendC::GlobalTensor<int32_t> debugTensor;
+            debugTensor.SetGlobalBuffer(reinterpret_cast<__gm__ int32_t *>(params.gmExpertTokenNums));
+            AscendC::LocalTensor<int32_t> debugLocal =
+                resource.ubBuf.template GetBufferByByte<int32_t>(0);
+            AscendC::Duplicate(debugLocal, static_cast<int32_t>(0), INT32_COUNT_PER_BLOCK);
+            debugLocal.SetValue(0, static_cast<int32_t>(AscendC::GetBlockIdx()));
+            debugLocal.SetValue(1, static_cast<int32_t>(AscendC::GetSubBlockIdx()));
+            debugLocal.SetValue(2, static_cast<int32_t>(aiCoreGroupNum));
+            debugLocal.SetValue(3, static_cast<int32_t>(aiCoreGroupIdx));
+            debugLocal.SetValue(4, static_cast<int32_t>(aicNum));
+            debugLocal.SetValue(5, static_cast<int32_t>(aivNum));
+            debugLocal.SetValue(6, static_cast<int32_t>(isActiveAiv ? 1 : 0));
+            debugLocal.SetValue(7, static_cast<int32_t>(isRecvCore ? 1 : 0));
+            debugLocal.SetValue(8, static_cast<int32_t>(isSendCore ? 1 : 0));
+            debugLocal.SetValue(9, static_cast<int32_t>(recvCoreNum));
+            debugLocal.SetValue(10, static_cast<int32_t>(sendCoreNum));
+            debugLocal.SetValue(11, static_cast<int32_t>(compCoreNum));
+            debugLocal.SetValue(12, static_cast<int32_t>(AscendC::GetBlockNum()));
+            debugLocal.SetValue(13, static_cast<int32_t>(AscendC::GetSubBlockNum()));
+            debugLocal.SetValue(14, static_cast<int32_t>(activeGroupCount));
+            debugLocal.SetValue(15, static_cast<int32_t>(sparseFastPath ? 1 : 0));
+            AscendC::SetFlag<AscendC::HardEvent::V_MTE3>(0);
+            AscendC::WaitFlag<AscendC::HardEvent::V_MTE3>(0);
+            AscendC::DataCopy(debugTensor, debugLocal, INT32_COUNT_PER_BLOCK);
+            AscendC::PipeBarrier<PIPE_MTE3>();
+        }
+        // ===== DEBUG END =====
+
         icache_preload(8);
         if constexpr (EXEC_FLAG & EXEC_FLAG_DEEP_FUSE) {
             AscendC::SyncAll<true>();
