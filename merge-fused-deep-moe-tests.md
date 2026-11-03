@@ -14,14 +14,17 @@ A3、A5 的权重、baseline、通信 Buffer 和计时实现各自保留，原�
 
 1. 合并测试入口。
 2. 保留 A3/A5 各自的执行逻辑。
-3. 清理无用函数和 import。
+3. 合并前对两个文件分三步精简：无效代码清理、前置辅助函数整合、限定范围的控制流精简。
 4. 更新跨文件依赖、CI 和文档。
 
 ## 功能点描述
 
 1. 不传 `--quant` 时运行 A3；传入 `fp8_e4m3`、`fp8_e5m2` 或 `fp4_e2m1` 时运行 A5。不增加 `--platform`，非法量化值直接报错。
 2. A3 继续运行 `test_loop`，A5 继续运行 `run_rank`。两条路径使用自己的权重、baseline 和性能统计。A5 dtype 在实际使用时解析，避免影响 A3 模块导入。
-3. 删除 A3 中没有调用的 `make_uniform_topk_idx`、`from_inclusive_prefix_sum`、`str_to_bool`。A5 已删除的 trace、量化日志和 profile debug 选项及辅助函数不再迁回。
+3. 合并前完成三步精简，降低合并 PR 的 diff 噪音：
+   - **无效代码清理**：A3 删除 `sys`/`time`/`partial`/`hash_tensor` 导入、`make_uniform_topk_idx`、`from_inclusive_prefix_sum`、`str_to_bool`；A5 删除 `format_triplet`、`run_buffer_fused_with_burn_in`、`log_quant_tensor` 系列、`trace_dir`/`kernel_trace_dir`/`dump_profile_events` 等已废弃参数及处理分支。
+   - **前置辅助函数整合**：A5 抽取 `_quant_and_cast_weight` 消除 gmm1/gmm2 量化重复，给 `make_random_profile_cases` 加 `total_case_count` 参数消除 `make_fixed_profile_cases` 的 Namespace hack；A3 抽取 `prepare_all_weights` 整合 `init_base_weights → init_baseline_weights → init_fused_weights_int8` 链式调用。
+   - **控制流精简（本次限定）**：A5 合并 `validate_random_profile_results` 中 `fixed_values` 的两轮 cross-iteration 校验；A3 topk_idx 计数循环向量化。`run_rank` 末尾统计打印嵌套留给合并后单独 PR。
 4. 保留其他测试使用的公共函数，将共享 A5 MC2 baseline 移至 `utils.py`，使 FusedDeepMoe 和 MegaMoe 都从工具模块导入，不再相互依赖。A5 CI 命令替换文件路径并补上 `--quant`；A3 命令和 generalization 脚本保持原样。
 
 ## 功能实现思路
@@ -33,6 +36,10 @@ A3、A5 的权重、baseline、通信 Buffer 和计时实现各自保留，原�
 清理函数前同时检查直接调用、函数对象引用和跨文件 import。`make_random_profile_cases`、`make_fixed_profile_cases` 通过 `case_builder` 调用，需要保留。
 
 先更新依赖和执行命令，再删除旧 A5 文件。核对合并前后的默认参数、公共接口和执行路径，确认现有测试覆盖没有减少。只处理当前工作树，不修改嵌套镜像目录。
+
+### 合并前精简策略
+
+三步精简作为合并 PR 的前置 commit，按顺序提交便于 review 和回滚。三步只触碰各自文件，不跨文件改动；迁 `utils.py` 和合并入口留到后续 commit。若控制流精简范围在实现时发现风险（如 `validate_random_profile_results` 两轮校验合并后漏掉某个断言路径），该子项可回退，不影响前两步成果。
 
 ## 功能实现设计
 
