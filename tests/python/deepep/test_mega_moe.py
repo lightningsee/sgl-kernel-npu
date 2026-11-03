@@ -11,7 +11,14 @@ import torch
 import torch.distributed as dist
 import torch_npu
 from deep_ep.buffer import FuseMode
-from utils import bench, bench_kineto, calc_diff, init_dist, make_hccl_pg_options
+from utils import (
+    bench,
+    bench_kineto,
+    calc_diff,
+    init_dist,
+    make_hccl_pg_options,
+    run_small_op_baseline,
+)
 
 torch_npu.npu.config.allow_internal_format = True
 os.environ["MOE_EXPERT_TOKEN_NUMS_TYPE"] = "1"
@@ -1523,8 +1530,6 @@ def finalize_case(
 
 
 def make_a5_small_op_call(args, launched_case, group_ep, rank, num_ranks):
-    from test_fused_deep_moe_a5 import run_small_op_baseline
-
     case, weights = launched_case["case"], launched_case["weights"]
     inputs = {
         "x": launched_case["x"],
