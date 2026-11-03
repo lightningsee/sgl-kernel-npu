@@ -10,6 +10,30 @@
 
 A3、A5 的权重、baseline、通信 Buffer 和计时实现各自保留，原有输入、参数默认值、随机种子、精度阈值和测试覆盖不变。`test_dispatch_ffn_combine.py` 和 `test_mega_moe.py` 仍作为独立测试文件维护，不合并进 FusedDeepMoe 文件；但 MegaMoe 对 `run_small_op_baseline` 的 import 来源会改为 `utils.py`（见"共享 A5 MC2 baseline"）。
 
+## 整体方案
+
+本方案采用“按算子组织测试、按平台保留执行链”的整合方式：FusedDeepMoe 对外只保留一个测试文件和命令行入口，A3/A5 在文件内部继续使用各自的实现，不为了形式上的复用统一权重、baseline 或数值语义。共享代码仅抽取已有明确复用关系的 A5 MC2 baseline，使测试模块统一依赖 `utils.py`，不再相互 import。
+
+目标结构如下：
+
+```text
+tests/python/deepep/
+├── test_fused_deep_moe.py        # 合并 A3/A5 FusedDeepMoe，统一 parser 和 main()
+├── test_dispatch_ffn_combine.py  # 保持独立，不纳入本次合并
+├── test_mega_moe.py              # 保持独立，从 utils 导入共享 MC2 baseline
+└── utils.py                      # 接收共享 A5 MC2 baseline 及其必要依赖
+```
+
+实施按以下顺序推进：
+
+1. **前置精简**：分别在原 A3、A5 文件中清理无效代码、整合辅助函数并完成限定范围的控制流精简，避免与代码搬移混在同一 diff 中。
+2. **抽取共享实现**：将 `run_small_op_baseline` 及必要依赖迁入 `utils.py`，FusedDeepMoe 和 MegaMoe 同步修改 import，并验证共享路径行为不变。
+3. **合并测试入口**：把 A5 剩余实现按原调用关系合入 `test_fused_deep_moe.py`，通过 `--quant` 预解析选择平台 parser 和 spawn 入口；不传 `--quant` 走 A3，三种 MXFP 模式走 A5。
+4. **迁移引用并删除旧入口**：更新 CI、文档和跨文件引用，确认新路径可用后删除 `test_fused_deep_moe_a5.py`，不保留兼容 wrapper。
+5. **分层回归**：依次完成语法与导入检查、A3/A5 FusedDeepMoe 设备回归、MegaMoe 共享 baseline 回归及混合测试公共接口检查。
+
+整个过程保持原有输入生成顺序、随机种子、第二返回值、精度阈值、profiler 事件和统计口径不变；A3 对外权重接口保持名称和签名不变，MXFP dtype 仅在实际使用时解析。只修改当前工作树，不处理嵌套镜像目录。
+
 ## 功能点名称
 
 1. 合并测试入口。
