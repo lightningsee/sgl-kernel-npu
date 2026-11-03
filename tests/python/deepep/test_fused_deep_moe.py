@@ -2,7 +2,6 @@ import argparse
 import os
 import random
 
-
 import torch
 import torch.distributed as dist
 import torch_npu
@@ -115,8 +114,6 @@ def init_fused_weights_int8(
     w2_scale_o = torch.nn.Parameter(w2_scale, requires_grad=False)
 
     return w13_int8_nz, w13_scale_o, w2_int8_nz, w2_scale_o
-
-
 
 
 # ======================== Baseline Reference ========================
@@ -593,9 +590,6 @@ def test_loop(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
 
     dist.barrier()
     dist.destroy_process_group()
-
-
-
 
 
 if __name__ == "__main__":
