@@ -46,7 +46,7 @@
 
 说明：两条路径使用同一 case 的输入和相同计时参数。调用 `bench` 时设置 `num_tests=args.performance_iters + 1`、`sync_fn=dist.barrier`，通过 NPU Event 计时并同步各 rank；首个计时样本被丢弃，对其余样本取平均值。最终输出 `small_ops_time`、`megamoe_time`，并按 `small_time / fused_time` 计算 MegaMoe 加速比。本表对应 `--enable-performance` 且非 `--performance-only` 的性能对比路径。
 
-# A5上已经覆盖的测试场景
+# A5上覆盖的测试场景
 1. 量化模式: mx_fp8_e4m3, mx_fp8_e5m2, mx_fp4_e2m1, mx_fp8_e4m3_w4
 2. 权重布局：per-expert: 每个专家独立Tensor; stacked: 专家堆叠Tensor. 默认all, 两种都测
 3. 权重格式：`mx_fp8_e4m3` ：ND、NZ；`mx_fp8_e5m2` ：ND；`mx_fp4_e2m1` ：NZ；`mx_fp8_e4m3_w4` ：NZ
@@ -56,6 +56,15 @@
 7. 激活函数：默认覆盖 SwiGLU；传入`--activation situ` 可覆盖 SiTU，并可通过`--beta` 、`--linear-beta` 组合多组参数
 8. 性能对比：覆盖 MegaMoe 与 MC2 小算子链的性能对比；小算子链支持按每 rank 512 tokens 分块，MegaMoe 单次处理完整batch
 9. 纯性能模式：`--performance-only` 下跳过精度和 baseline，只测 MegaMoe，使用`bench_kineto` 计时
+
+# A3上覆盖的测试场景
+1. 量化模式：`w4a8` 、`w8a8` ，每次运行选择一种
+2. 精度参考：MC2 Dispatch → GMM1 → 激活 → 动态量化 → GMM2 → Combine 小算子链
+3. 被测路径： DeepEP`fused_deep_moe` / MegaMoe 融合路径
+4. 激活： 默认 SwiGLU；可配置 SiTU，并组合多组`beta` 、`linear_beta`
+5. token: 每个 case 使用`--num-tokens` 指定的长度；A3 不自动增加半长度和 rank jitter
+6. 精度校验： 融合输出与 MC2 baseline 的`calc_diff < 1e-4` ，并校验专家 token 计数一致
+7. 性能模式：可测 MC2 小算子链与 MegaMoe 的耗时和加速比，或使用`--performance-only` 只测 MegaMoe
 
 # A5上仍存在的覆盖盲点
 1. 只有全 rank 随机 TopK，没有强制构造热点专家、单专家集中、指定空专家、特定源 rank→目标 rank 等场景；随机出现不等于稳定覆盖
