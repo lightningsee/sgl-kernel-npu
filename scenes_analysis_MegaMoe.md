@@ -1,62 +1,63 @@
-# MegaMoe A3/A5 调用链场景分析
+# 深度模型（MoE）算子测试与覆盖矩阵说明
 
-## 对齐目标
+## 路由场景（topk_idx 生成）
 
-CANN 原生 MegaMoe 与 DeepEP 封装的 wrapper-equivalence 已完成验证，后续可将 A5 精度参考切换为 MC2 小算子链。目标调用链：
+| 路由场景 | topk_idx 生成方式 | 触发参数 | 代码位置 |
+|---|---|---|---|
+| 全 rank 随机路由 | 每个 rank 独立生成随机专家分数，并通过 TopK 选择全局专家 ID | 不需要，默认执行 | 121-132 行（生成）；1342-1344 行（调用） |
 
-```text
-build_case_matrix
-  → prepare_case
-  → run_small_op_reference（A3/A5 各自量化实现）
-  → run_fused_reference
-  → 公共精度校验
-  → bench(小算子链, MegaMoe)
-```
+# MegaMoe 测试参数说明
 
-## 功能点 1：统一 case 矩阵
+`tests/python/deepep/test_mega_moe.py` 的主要命令行参数如下：
 
-A3/A5 都覆盖 activation、beta、token 全量/半量和 rank jitter；性能模式仍使用单长度、无 jitter 输入。
+| 参数 | 类型 | 默认值 | 用途 / 意图 |
+|---|---|---:|---|
+| `--num-processes` | `int` | `16` | 本机启动的 worker 进程数，每个进程对应一个 rank。 |
+| `--quant-mode` | `str` | `"w4a8"` | 指定权重/激活量化模式。A3：`w4a8`、`w8a8`；A5：`mx_fp8_e4m3`、`mx_fp8_e5m2`、`mx_fp4_e2m1`、`mx_fp8_e4m3_w4`。 |
+| `--num-tokens` | `int` | `64` | 每个 rank 生成的输入 token 数。A5 精度测试还会覆盖约一半长度的场景；性能测试只测指定长度。 |
+| `--hidden` | `int` | `7168` | 输入及输出 token 的隐藏层维度。 |
+| `--moe-intermediate-size` | `int` | `3072` | 每个 MoE 专家的中间层隐藏维度。 |
+| `--num-topk` | `int` | `8` | 每个 token 路由选择的专家数量。 |
+| `--num-experts` | `int` | `64` | EP 集群的全局专家总数，不是单卡本地专家数。 |
+| `--activation` | `str` | `"swiglu"` | 指定激活函数测试项，支持逗号分隔，例如 `swiglu`、`situ` 或 `swiglu,situ`。 |
+| `--beta` | `str` | `"4.0"` | SiTU 激活的 `beta` 测试值；支持逗号分隔的浮点数列表，如 `1.0,4.0`。 |
+| `--linear-beta` | `str` | `"25.0"` | SiTU 激活的线性项 `linear_beta` 测试值；支持逗号分隔，数值 `0` 会转换为 `None`。 |
+| `--enable-performance` | 布尔标志 | `False` | 精度校验完成后，增加 MegaMoe 与 MC2 小算子链的性能对比；传入即为 `True`。 |
+| `--performance-only` | 布尔标志 | `False` | 跳过精度 baseline，仅执行 MegaMoe 性能测试；同时自动开启 `--enable-performance`。 |
+| `--performance-iters` | `int` | `30` | 性能测试的迭代次数。 |
+| `--weight-layout` | `str` | `"all"` | 仅 A5：权重及 scale 的 TensorList 布局。可选 `all`、`per-expert`、`stacked`；`all` 表示两种布局都测试。 |
+| `--weight-format` | `str` | `"all"` | 仅 A5：权重存储格式。可选 `all`、`ND`、`NZ`；实际允许格式由量化模式决定。 |
+| `--routing-dtype` | `str` | `"all"` | 仅 A5：路由权重的数据类型。可选 `all`、`bf16`、`fp32`；`all` 表示两种类型都测试。 |
 
-- 修改 `build_case_matrix`：A3 case 增加 `num_tokens=tokens + rank * token_jitter`，`routing_dtype` 仍只用于 A5。
-- `prepare_case` 已读取 `case["num_tokens"]`，A3 已通过 all_reduce 获取最大 token 数，无需修改。
-- A3 `run_baseline_reference` 已支持 padding、`x_active_mask` 和输出裁剪，无需修改。
-- `run_a5_scenes` 的 capacity 已覆盖最大 rank token 数，`run_fused_reference` 和 `finalize_case` 无需修改。
+# MegaMoe 正确性校验
 
-## 功能点 2：对齐 routing dtype 与精度校验
+校验主入口为 `finalize_case`（`test_mega_moe.py` 1467-1529 行）。A3 以 `run_baseline_reference`（878-1001 行）为参考，A5 以 `run_a5_reference`（1004-1037 行）为参考，二者均与 `run_fused_reference`（1241-1271 行）的融合算子输出进行比对。
 
-A3 routing weights 已为 FP32；A5 使用 `--routing-dtype fp32` 即可对齐。A3 的 int32 与 A5 FP32 路由场景的 int64 `topk_idx` 属于接口差异，不强行统一。
+| 校验项 | 阈值 | 代码位置 | 说明 |
+|---|---|---|---|
+| 全卡最大 `calc_diff` | A3 上测试：`1e-4`；A5 上测试：`1e-5` | 35-44、1492-1497、1516-1519 行；| 单卡计算 diff 后通过 `all_reduce(MAX)` 得到全卡最大值；`max_diff >=` 对应平台阈值即失败。A3 阈值适用于 `w4a8/w8a8`，A5 阈值适用于 MXFP 系列，用于 wrapper 等价性校验，不代表量化精度上限。 |
 
-若将 `routing_dtype` 扩展为 A3 测试维度：
+# MegaMoe 性能测试
 
-- 修改 `build_case_matrix`，为 A3 case 增加 `routing_dtype`。
-- 修改 `prepare_case`，将 softmax 和 routing weight dtype 转换整理为公共逻辑。
-- 修改 `build_parser`，将 `--routing-dtype` 调整为公共参数，并分别限制平台合法值。
-- 检查 `run_baseline_reference`/`run_mc2_combine` 对 BF16 routing weights 的支持；不支持时 A3 仅开放 FP32。
+| 测试对象 | 计时方式 | 代码位置 | 说明 |
+|---|---|---|---|
+| baseline 小算子链（`small_fn`） | `bench` 函数 | 1693-1699 行 | 对完整 baseline 小算子链计时，结果记为 `small_time`。 |
+| MegaMoe 融合算子（`fused_fn`） | `bench` 函数 | 1693-1699 行 | 对完整 MegaMoe 融合路径计时，结果记为 `fused_time`。 |
 
-精度校验统一检查输出形状、有限性、`calc_diff` 和 `expert_token_nums`。`finalize_case` 复用公共校验结构，但 `DIFF_THRESHOLDS`、`rtol/atol` 按量化模式分别保留。
+说明：两条路径使用同一 case 的输入和相同计时参数。调用 `bench` 时设置 `num_tests=args.performance_iters + 1`、`sync_fn=dist.barrier`，通过 NPU Event 计时并同步各 rank；首个计时样本被丢弃，对其余样本取平均值。最终输出 `small_ops_time`、`megamoe_time`，并按 `small_time / fused_time` 计算 MegaMoe 加速比。本表对应 `--enable-performance` 且非 `--performance-only` 的性能对比路径。
 
-## 功能点 3：对齐激活参考
+# A5上已经覆盖的测试场景
+1. 量化模式: mx_fp8_e4m3, mx_fp8_e5m2, mx_fp4_e2m1, mx_fp8_e4m3_w4
+2. 权重布局：per-expert: 每个专家独立Tensor; stacked: 专家堆叠Tensor. 默认all, 两种都测
+3. 权重格式：`mx_fp8_e4m3` ：ND、NZ；`mx_fp8_e5m2` ：ND；`mx_fp4_e2m1` ：NZ；`mx_fp8_e4m3_w4` ：NZ
+4. 路由方式：全 rank 独立随机生成专家分数并执行 TopK，使用全局专家 ID，可覆盖跨 rank 路由
+5. token长度：精度测试覆盖`num_tokens` 和`max(1, num_tokens // 2)` 两种基础长度
+6. 跨rank不等长：精度测试中，各rank的token数为`基础长度 + rank × 8` ，覆盖不同 rank 输入长度不同的场景，不做 padding
+7. 激活函数：默认覆盖 SwiGLU；传入`--activation situ` 可覆盖 SiTU，并可通过`--beta` 、`--linear-beta` 组合多组参数
+8. 性能对比：覆盖 MegaMoe 与 MC2 小算子链的性能对比；小算子链支持按每 rank 512 tokens 分块，MegaMoe 单次处理完整batch
+9. 纯性能模式：`--performance-only` 下跳过精度和 baseline，只测 MegaMoe，使用`bench_kineto` 计时
 
-- 修改 `utils.py::run_small_op_baseline`：增加可选 SiTU reference 参数，默认继续使用 `fused_situ_reference`。
-- 修改 `make_a5_small_op_call`：显式传入 MegaMoe 的 `situ_reference`。
-- `situ_reference`、`apply_activation` 和 FusedDeepMoe 调用方无需修改。
-
-## 功能点 4：精度与性能复用同一 MC2 小算子链
-
-- 修改 `launch_case`：A5 精度路径由 `run_a5_reference` 改为 `make_a5_small_op_call(...)()`。
-- 修改 `test_loop`：A5 MC2 通信组在精度模式也创建，不再仅限性能对比模式。
-- 修改 `run_a5_scenes`：完全弃用 CANN 参考后，删除参考路径 `reference_buffer` 的创建和销毁，并将小算子支持场景校验移到公共入口。
-- `run_a5_reference` 不再进入主调用链，可删除或保留为可选调试参考。
-- `run_test_cases` 已在性能段使用 `make_a5_small_op_call`，无需修改；性能-only 模式继续使用 `bench_kineto`。
-
-切换优先覆盖 MXFP8、stacked、ND、等长 token 和 SwiGLU；per-expert、NZ、FP4、A8W4 及不等长 token 在完成适配后扩展。MC2 精度对比使用独立容差，不沿用 wrapper-equivalence 阈值。
-
-## 功能点 5：统一权重准备接口
-
-统一由 `prepare_*_weights` 准备完整的 baseline/fused 权重，不强行统一 A3 INT8 与 A5 MXFP 的权重键名和格式。
-
-- 修改 `prepare_a5_scene_weights`：增加 `include_baseline` 参数，同时准备 MC2 baseline 所需的权重和 scale。
-- 修改 `run_a5_scenes`：传入 `include_baseline=not args.performance_only`。
-- 修改 `make_a5_small_op_call`：直接消费预准备的 baseline 权重，移除函数内临时 transpose/转换逻辑。
-- A3 `prepare_scene_weights` 已支持 `include_baseline`，无需修改。
-- `run_baseline_reference`、`run_fused_reference` 和 `utils.py` 在此功能点无需修改。
+# A5上仍存在的覆盖盲点
+1. 只有全 rank 随机 TopK，没有强制构造热点专家、单专家集中、指定空专家、特定源 rank→目标 rank 等场景；随机出现不等于稳定覆盖
+2. FP4、A8W4、`per-expert` 、NZ 等场景没有 baseline 加速比；性能测试也只测单 token 长度且不做 rank jitter
+3. A5精度参考是run_a5_reference中的CANN原生MegaMoe，校验的是DeepEP wrapper与 CANN的等价性，不能替代MC2小算子链的数值精度验证
