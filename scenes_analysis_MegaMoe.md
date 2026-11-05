@@ -1,8 +1,15 @@
 # 深度模型（MoE）算子测试与覆盖矩阵说明
 
+算子的测试部分包括：
+1. 精度测试
+2. 基线对齐
+3. 绝对误差，相对误差，容忍率
+4. 激活测试
+5. 内存排布方面：per-expert, stacked
+
 ## 路由场景（topk_idx 生成）
 
-| 路由场景 | topk_idx 生成方式 | 触发参数 | 代码位置 |
+| 场景 | topk_idx 生成方式 | 触发参数 | 代码位置 |
 |---|---|---|---|
 | 全 rank 随机路由 | 每个 rank 独立生成随机专家分数，并通过 TopK 选择全局专家 ID | 不需要，默认执行 | 121-132 行（生成）；1342-1344 行（调用） |
 
@@ -35,18 +42,74 @@
 
 | 校验项 | 阈值 | 代码位置 | 说明 |
 |---|---|---|---|
-| 全卡最大 `calc_diff` | A3 上测试：`1e-4`；A5 上测试：`1e-5` | 35-44、1492-1497、1516-1519 行；| 单卡计算 diff 后通过 `all_reduce(MAX)` 得到全卡最大值；`max_diff >=` 对应平台阈值即失败。A3 阈值适用于 `w4a8/w8a8`，A5 阈值适用于 MXFP 系列，用于 wrapper 等价性校验，不代表量化精度上限。 |
+| 全卡最大 `calc_diff` | A3 上测试：`1e-4`；A5 上测试：`1e-5` | 35-44、1492-1497、1516-1519 行 | `all_reduce(MAX)` 汇总全卡最大 diff，`max_diff >=` 阈值则失败。 |
+| 专家 token 计数一致性（`counts_match`） | 完全相等，无容差 | 176-187、1499-1506、1516-1519 行 | `baseline_counts` 与 `fused_counts` 统一格式后用 `torch.equal` 比较本地专家 token 数；任一 rank 不一致则失败。 |
+
+```python
+baseline_out = launched_case["baseline_out"]
+fused_out = launched_case["fused_out"]
+local_diff = calc_diff(baseline_out.float(), fused_out.float(),)
+diff_tensor = torch.tensor(local_diff, dtype=torch.float32, device=device)
+dist.all_reduce(diff_tensor, op=dist.ReduceOp.MAX)
+
+baseline_counts = launched_case["baseline_counts"]
+fused_counts = launched_case["fused_counts"]
+counts_match = torch.equal(
+    normalize_expert_counts(baseline_counts, num_local_experts, device),
+    normalize_expert_counts(fused_counts, num_local_experts, device),
+)
+counts_mismatch = torch.tensor(
+    0 if counts_match else 1, dtype=torch.int32, device=device
+)
+dist.all_reduce(counts_mismatch, op=dist.ReduceOp.MAX)
+```
+
 
 # MegaMoe 性能测试
 
 | 测试对象 | 计时方式 | 代码位置 | 说明 |
 |---|---|---|---|
-| baseline 小算子链（`small_fn`） | `bench` 函数 | 1693-1699 行 | 对完整 baseline 小算子链计时，结果记为 `small_time`。 |
-| MegaMoe 融合算子（`fused_fn`） | `bench` 函数 | 1693-1699 行 | 对完整 MegaMoe 融合路径计时，结果记为 `fused_time`。 |
+| baseline 小算子链（性能对比模式，`small_fn`） | `bench` 函数 | 1693-1699 行 | 对完整 baseline 小算子链计时，结果记为 `small_time`。 |
+| MegaMoe 融合算子（性能对比模式，`fused_fn`） | `bench` 函数 | 1693-1699 行 | 对完整 MegaMoe 融合路径计时，结果记为 `fused_time`，并与 `small_time` 计算加速比。 |
+| MegaMoe 融合算子（单独性能测试） | `bench_kineto` 函数 | 1711-1728 行 | 在 `--performance-only` 下跳过 baseline 和精度校验，只执行 MegaMoe；|
 
-说明：两条路径使用同一 case 的输入和相同计时参数。调用 `bench` 时设置 `num_tests=args.performance_iters + 1`、`sync_fn=dist.barrier`，通过 NPU Event 计时并同步各 rank；首个计时样本被丢弃，对其余样本取平均值。最终输出 `small_ops_time`、`megamoe_time`，并按 `small_time / fused_time` 计算 MegaMoe 加速比。本表对应 `--enable-performance` 且非 `--performance-only` 的性能对比路径。
+说明：性能对比模式的两条路径使用同一 case 的输入和相同计时参数。调用 `bench` 时设置 `num_tests=args.performance_iters + 1`、`sync_fn=dist.barrier`，通过 NPU Event 计时并同步各 rank；首个计时样本被丢弃，对其余样本取平均值。最终输出 `small_ops_time`、`megamoe_time`，并按 `small_time / fused_time` 计算 MegaMoe 加速比。表中 `bench` 两行对应 `--enable-performance` 且非 `--performance-only` 的性能对比路径，`bench_kineto` 一行对应 `--performance-only` 的单独性能测试路径。
 
-# A5上覆盖的测试场景
+```python
+small_fn = partial(
+    run_baseline_reference, *call_args, group_ep=baseline_group_ep, barrier_group=baseline_group,
+    ep_world_size=num_ranks, ep_rank_id=rank, enable_dispatch_v2=enable_dispatch_v2,)
+fused_fn = partial(run_fused_reference, fused_buffer, *call_args)
+small_time, fused_time = (
+    bench(
+        fn,
+        num_tests=args.performance_iters + 1,
+        sync_fn=dist.barrier,
+    )[0]
+    for fn in (small_fn, fused_fn)
+)
+
+fused_time = bench_kineto(
+    partial(
+        run_fused_reference,
+        fused_buffer,
+        launched_case["x"],
+        launched_case["topk_idx"],
+        launched_case["topk_weights"],
+        launched_case["max_num_tokens"],
+        args.num_experts,
+        launched_case["weights"],
+        case["activation"],
+        case["beta"],
+        case["linear_beta"],
+    ),
+    "MegaMoe",
+    num_tests=args.performance_iters,
+    barrier_comm_profiling=True,
+)
+```
+
+# A5上MegaMoe覆盖的测试场景
 1. 量化模式: mx_fp8_e4m3, mx_fp8_e5m2, mx_fp4_e2m1, mx_fp8_e4m3_w4
 2. 权重布局：per-expert: 每个专家独立Tensor; stacked: 专家堆叠Tensor. 默认all, 两种都测
 3. 权重格式：`mx_fp8_e4m3` ：ND、NZ；`mx_fp8_e5m2` ：ND；`mx_fp4_e2m1` ：NZ；`mx_fp8_e4m3_w4` ：NZ
@@ -57,7 +120,7 @@
 8. 性能对比：覆盖 MegaMoe 与 MC2 小算子链的性能对比；小算子链支持按每 rank 512 tokens 分块，MegaMoe 单次处理完整batch
 9. 纯性能模式：`--performance-only` 下跳过精度和 baseline，只测 MegaMoe，使用`bench_kineto` 计时
 
-# A3上覆盖的测试场景
+# A3上MegaMoe覆盖的测试场景
 1. 量化模式：`w4a8` 、`w8a8` ，每次运行选择一种
 2. 精度参考：MC2 Dispatch → GMM1 → 激活 → 动态量化 → GMM2 → Combine 小算子链
 3. 被测路径： DeepEP`fused_deep_moe` / MegaMoe 融合路径
