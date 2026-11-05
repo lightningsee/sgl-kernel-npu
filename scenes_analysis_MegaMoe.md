@@ -111,23 +111,151 @@ fused_time = bench_kineto(
 
 # A5上MegaMoe覆盖的测试场景
 1. 量化模式: mx_fp8_e4m3, mx_fp8_e5m2, mx_fp4_e2m1, mx_fp8_e4m3_w4
+```python
+A5_QUANT_MODES = (
+    "mx_fp8_e4m3",
+    "mx_fp8_e5m2",
+    "mx_fp4_e2m1",
+    "mx_fp8_e4m3_w4",
+)
+A5_FP4_WEIGHT_MODES = frozenset({
+    "mx_fp4_e2m1",
+    "mx_fp8_e4m3_w4",
+})
+```
 2. 权重布局：per-expert: 每个专家独立Tensor; stacked: 专家堆叠Tensor. 默认all, 两种都测
 3. 权重格式：`mx_fp8_e4m3` ：ND、NZ；`mx_fp8_e5m2` ：ND；`mx_fp4_e2m1` ：NZ；`mx_fp8_e4m3_w4` ：NZ
+```python
+formats = {
+    "mx_fp8_e4m3": ("ND", "NZ"),
+    "mx_fp8_e5m2": ("ND",),
+    "mx_fp4_e2m1": ("NZ",),
+    "mx_fp8_e4m3_w4": ("NZ",),
+}[args.quant_mode]
+```
 4. 路由方式：全 rank 独立随机生成专家分数并执行 TopK，使用全局专家 ID，可覆盖跨 rank 路由
+```python
+    scores = torch.randn(
+    (num_tokens, num_experts),
+    dtype=torch.float32,
+    device=device,
+)
+topk_weights, topk_ids = torch.topk(
+    scores,
+    num_topk,
+    dim=-1,
+    largest=True,
+    sorted=False,
+)
+- `scores` 的列数是`num_experts` ，即 全局专家总数。
+- `torch.topk` 返回被选专家的列号，因此`topk_idx` 是`[0, num_experts-1]` 范围内的全局专家 ID。
+每个 case 调用路由生成函数
+topk_idx, topk_weights = make_topk_inputs(
+    num_tokens, args.num_experts, args.num_topk, device, topk_dtype
+)
+```
 5. token长度：精度测试覆盖`num_tokens` 和`max(1, num_tokens // 2)` 两种基础长度
 6. 跨rank不等长：精度测试中，各rank的token数为`基础长度 + rank × 8` ，覆盖不同 rank 输入长度不同的场景，不做 padding
+```python
+核心代码在build_case_matrix
+token_jitter = 0 if args.enable_performance else A5_ACCURACY_TOKEN_JITTER
+num_tokens = tokens + rank * token_jitter
+```
 7. 激活函数：默认覆盖 SwiGLU；传入`--activation situ` 可覆盖 SiTU，并可通过`--beta` 、`--linear-beta` 组合多组参数
+```python
+cases = []
+    for activation in activations:
+        if activation == "swiglu":
+            cases.append(
+                {
+                    "activation": "swiglu",
+                    "beta": 1.0,
+                    "linear_beta": None,
+                }
+            )
+            continue
+        if activation != "situ":
+            raise ValueError(f"Unsupported activation case: {activation}")
+        for beta in betas:
+            for linear_beta in linear_betas:
+                cases.append(
+                    {
+                        "activation": "situ",
+                        "beta": beta,
+                        "linear_beta": linear_beta,
+                    }
+                )
+```
 8. 性能对比：覆盖 MegaMoe 与 MC2 小算子链的性能对比；小算子链支持按每 rank 512 tokens 分块，MegaMoe 单次处理完整batch
 9. 纯性能模式：`--performance-only` 下跳过精度和 baseline，只测 MegaMoe，使用`bench_kineto` 计时
 
 # A3上MegaMoe覆盖的测试场景
 1. 量化模式：`w4a8` 、`w8a8` ，每次运行选择一种
+```python
+prepare_weights = (
+    prepare_w4a8_weights if quant_mode == "w4a8" else prepare_w8a8_weights
+)
+```
 2. 精度参考：MC2 Dispatch → GMM1 → 激活 → 动态量化 → GMM2 → Combine 小算子链
+```python
+run_mc2_dispatch(...)
+run_grouped_matmul_quantized(...)  # GMM1
+apply_activation(...)
+torch_npu.npu_dynamic_quant(...)
+run_grouped_matmul_quantized(...)  # GMM2
+run_mc2_combine(...)
+```
 3. 被测路径： DeepEP`fused_deep_moe` / MegaMoe 融合路径
 4. 激活： 默认 SwiGLU；可配置 SiTU，并组合多组`beta` 、`linear_beta`
 5. token: 每个 case 使用`--num-tokens` 指定的长度；A3 不自动增加半长度和 rank jitter
+```python
+代码在build_case_matrix函数，因为不是A5,不会新增num_tokens // 2 的半长度case
+不会计算tokens + rank * token_jitter, 直接使用tokens
+
+num_tokens = case.get("num_tokens", args.num_tokens)
+x = torch.randn((num_tokens, args.hidden), dtype=torch.bfloat16, device=device)
+```
 6. 精度校验： 融合输出与 MC2 baseline 的`calc_diff < 1e-4` ，并校验专家 token 计数一致
+```python
+DIFF_THRESHOLDS = {
+    "w4a8": 1e-4,
+    "w8a8": 1e-4,
+    ...
+}
+local_diff = calc_diff(
+    baseline_out.float(),
+    fused_out.float(),
+)
+diff_tensor = torch.tensor(local_diff, ...)
+dist.all_reduce(diff_tensor, op=dist.ReduceOp.MAX)
+比较专家 token 计数:
+counts_match = torch.equal(
+    normalize_expert_counts(baseline_counts, ...),
+    normalize_expert_counts(fused_counts, ...),
+)
+if counts_mismatch.item() != 0:
+    failures.append("expert_token_nums mismatch across ranks")
+
+if max_diff >= diff_threshold:
+    failures.append(...)
+```
 7. 性能模式：可测 MC2 小算子链与 MegaMoe 的耗时和加速比，或使用`--performance-only` 只测 MegaMoe
+```python
+small_fn = partial(
+    run_baseline_reference,
+    *call_args,
+    group_ep=baseline_group_ep,
+    barrier_group=baseline_group,
+    ep_world_size=num_ranks,
+    ep_rank_id=rank,
+    enable_dispatch_v2=enable_dispatch_v2,
+)
+fused_fn = partial(run_fused_reference, fused_buffer, *call_args)
+small_time, fused_time = (
+    bench(fn, ...)[0]
+    for fn in (small_fn, fused_fn)
+)
+```
 
 # A5上仍存在的覆盖盲点
 1. 只有全 rank 随机 TopK，没有强制构造热点专家、单专家集中、指定空专家、特定源 rank→目标 rank 等场景；随机出现不等于稳定覆盖
