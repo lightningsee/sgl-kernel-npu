@@ -260,3 +260,30 @@ small_time, fused_time = (
 1. 只有全 rank 随机 TopK，没有强制构造热点专家、单专家集中、指定空专家、特定源 rank→目标 rank 等场景；随机出现不等于稳定覆盖
 2. FP4、A8W4、`per-expert` 、NZ 等场景没有 baseline 加速比；性能测试也只测单 token 长度且不做 rank jitter
 3. A5精度参考是run_a5_reference中的CANN原生MegaMoe，校验的是DeepEP wrapper与 CANN的等价性，不能替代MC2小算子链的数值精度验证
+
+# A5上的测试用例
+```bash
+python3 test_mega_moe.py --num-processes 8 --quant-mode mx_fp4_e2m1
+python3 test_mega_moe.py --num-processes 8 --quant-mode mx_fp8_e4m3
+python3 test_mega_moe.py --num-processes 8 --quant-mode mx_fp8_e5m2
+python3 test_mega_moe.py --num-processes 8 --quant-mode mx_fp8_e4m3_w4
+python3 test_mega_moe.py --num-processes 8 --num-tokens 1024 --enable-performance --hccl-buffsize 4096
+python3 test_mega_moe.py --num-processes 8 --num-tokens 2048 --enable-performance --hccl-buffsize 4096
+python3 test_mega_moe.py --num-processes 8 --num-tokens 4096 --enable-performance --hccl-buffsize 4096
+python3 test_mega_moe.py --num-processes 8 --num-tokens 8192 --enable-performance --hccl-buffsize 4096
+python3 test_mega_moe.py --num-processes 8 --num-tokens 8192 --activation situ --enable-performance --hccl-buffsize 4096
+python3 test_mega_moe.py --num-processes 8 --num-tokens 8192 --activation situ --quant-mode mx_fp8_e4m3 --enable-performance --hccl-buffsize 4096
+```
+
+# A3上的测试用例
+```bash
+python3 test_mega_moe.py --num-processes 8 --activation situ
+python3 test_mega_moe.py --num-processes 8 --num-experts 64 --activation swiglu
+python3 test_mega_moe.py --num-processes 8 --num-experts 64 --quant-mode w8a8 --activation swiglu --hccl-buffsize 200
+python3 test_mega_moe.py --num-processes 8 --num-experts 64 --quant-mode w4a8 --activation swiglu --hccl-buffsize 200
+python3 test_mega_moe.py --num-processes 8 --num-experts 64 --num-topk 16 --quant-mode w4a8 --activation swiglu --hccl-buffsize 200
+python3 test_mega_moe.py --num-processes 8 --num-experts 1024 --hccl-buffsize 2000
+python3 test_mega_moe.py --num-processes 8 --hidden 8192 --hccl-buffsize 200
+python3 test_mega_moe.py --num-processes 8 --quant-mode w8a8 --num-tokens 4096 --moe-intermediate-size 2048 --num-experts 256 --activation swiglu --performance-only
+python3 test_mega_moe.py --num-processes 16 --quant-mode w8a8 --num-tokens 4096 --moe-intermediate-size 2048 --num-experts 256 --activation swiglu --performance-only
+```
