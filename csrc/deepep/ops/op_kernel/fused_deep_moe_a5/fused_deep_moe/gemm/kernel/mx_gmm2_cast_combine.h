@@ -773,14 +773,32 @@ public:
         }
         if constexpr (EXEC_FLAG & EXEC_FLAG_DEEP_FUSE) {
             CleanRoutedX2ReadyState(params.problemCount);
+            if (AscendC::GetBlockIdx() < 4) {
+                FUSED_MOE_DBG("tail cleanX2 done blk=%u\n", AscendC::GetBlockIdx());
+            }
         }
         if constexpr (EXEC_FLAG & EXEC_FLAG_DEEP_FUSE) {
             if (AscendC::GetSubBlockIdx() == 0) {
+                if (AscendC::GetBlockIdx() < 4) {
+                    // 尾段卡死定位：有 enter 无 PASS = SOFT_SYNC 计数未到 target（AIC 侧没跑完/没递增）
+                    FUSED_MOE_DBG("tail checksync enter core=%u target=%u\n", coreIdx, target);
+                }
                 CheckSyncFlag(reinterpret_cast<__gm__ int32_t *>(syncGmAddr + GMM2::SOFT_SYNC_OFFSET),
                               static_cast<int32_t>(coreIdx), target);
+                if (AscendC::GetBlockIdx() < 4) {
+                    FUSED_MOE_DBG("tail checksync PASS core=%u\n", coreIdx);
+                }
             }
             AscendC::PipeBarrier<PIPE_ALL>();
+            if (AscendC::GetBlockIdx() < 4) {
+                // 尾段卡死定位：有 enter 无 PASS = 有核（AIV 或 AIC）没到 SyncAll 会合点
+                FUSED_MOE_DBG("tail syncall enter blk=%u sub=%u\n", AscendC::GetBlockIdx(),
+                              AscendC::GetSubBlockIdx());
+            }
             AscendC::SyncAll<true>();
+            if (AscendC::GetBlockIdx() < 4) {
+                FUSED_MOE_DBG("tail syncall PASS blk=%u\n", AscendC::GetBlockIdx());
+            }
             AscendC::PipeBarrier<PIPE_ALL>();
         }
         if (AscendC::GetSubBlockIdx() == 0) {
@@ -808,6 +826,12 @@ public:
                                            params.profile->Now());
                 }
             }
+            if (AscendC::GetBlockIdx() < 4) {
+                FUSED_MOE_DBG("tail zeroclean done blk=%u\n", AscendC::GetBlockIdx());
+            }
+        }
+        if (AscendC::GetBlockIdx() < 4) {
+            FUSED_MOE_DBG("KERNEL END blk=%u sub=%u\n", AscendC::GetBlockIdx(), AscendC::GetSubBlockIdx());
         }
     }
 
