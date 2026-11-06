@@ -57,6 +57,7 @@ output/
 # cannbot workflow & IDE plugin assets (embedded git repos, not project code)
 .cannbot/
 .trae/
+AGENTS.md
 /asc-devkit/
 /cann-samples/
 
