@@ -43,6 +43,17 @@ if ("${ASCEND_COMPUTE_UNIT}" MATCHES "^ascend950")
         -DCATLASS_ARCH=3510
         -DDEEPEP_CATLASS_A5_COMPAT=1
         -DDEEPEP_SKIP_DISPATCH_FFN_COMBINE=1)
+
+    # 1C1V 串行模拟 / 调试打印开关：由外部环境变量控制并透传为编译期宏，默认关闭（A5 原行为不变）。
+    # 用法: FUSED_MOE_SIM_1C1V=1 FUSED_MOE_DEBUG_PRINT=1 bash build.sh -a deepep Ascend950
+    if (DEFINED ENV{FUSED_MOE_SIM_1C1V})
+        list(APPEND _A5_FUSED_DEEP_MOE_INC_OPTS -DFUSED_MOE_SIM_1C1V)
+        message(STATUS "FUSED_MOE_SIM_1C1V: 1C1V serial simulation enabled")
+    endif()
+    if (DEFINED ENV{FUSED_MOE_DEBUG_PRINT})
+        list(APPEND _A5_FUSED_DEEP_MOE_INC_OPTS -DFUSED_MOE_DEBUG_PRINT)
+        message(STATUS "FUSED_MOE_DEBUG_PRINT: kernel printf enabled")
+    endif()
 endif()
 
 npu_op_kernel_sources(ascendc_kernels
@@ -58,8 +69,15 @@ npu_op_package_add(${package_name}
     LIBRARY ascendc_kernels
 )
 
+# printf 调试输出依赖 ASCENDC_DUMP：开 FUSED_MOE_DEBUG_PRINT 时同步放开，平时保持 0 不变
+if (DEFINED ENV{FUSED_MOE_DEBUG_PRINT})
+    set(_ASCENDC_DUMP_FLAG "-DASCENDC_DUMP=1")
+else()
+    set(_ASCENDC_DUMP_FLAG "-DASCENDC_DUMP=0")
+endif()
+
 npu_op_kernel_options("" ALL OPTIONS
-    -DASCENDC_DUMP=1
+    ${_ASCENDC_DUMP_FLAG}
     --cce-auto-sync=off
     ${_DISPATCH_FFN_INC_OPTS}
     ${_A5_FUSED_DEEP_MOE_INC_OPTS})

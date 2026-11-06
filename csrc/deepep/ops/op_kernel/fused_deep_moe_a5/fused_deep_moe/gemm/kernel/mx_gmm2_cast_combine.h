@@ -16,6 +16,14 @@
 
 using namespace Cam;
 
+// 1C1V 串行模式开关：真 1C1V 平台运行时按 GetSubBlockNum()==1 自动生效；
+// A5(1C2V) 上模拟 1C1V 时，编译期额外定义 FUSED_MOE_SIM_1C1V 强制所有核走串行路径（sub1 空转）。
+#if defined(FUSED_MOE_SIM_1C1V)
+#define FUSED_MOE_SERIAL_MODE() (true)
+#else
+#define FUSED_MOE_SERIAL_MODE() (AscendC::GetSubBlockNum() == 1)
+#endif
+
 namespace Catlass::Gemm::Kernel {
 namespace GMM2 {
 constexpr uint64_t SOFT_SYNC_OFFSET = 982 * 1024;
@@ -621,9 +629,15 @@ public:
             AscendC::PipeBarrier<PIPE_ALL>();
             if constexpr (EXEC_FLAG & EXEC_FLAG_SHARED_EXPERT) {
                 if (AscendC::GetSubBlockIdx() == 0) {
-                    AscendC::CrossCoreSetFlag<0x0, PIPE_MTE3>(MoeDistributeCombineImpl::SEND_SYNC_EVENT_ID);
-                    if constexpr ((EXEC_FLAG & EXEC_FLAG_DEEP_FUSE) == 0) {
-                        AscendC::CrossCoreSetFlag<0x0, PIPE_MTE3>(MoeDistributeCombineImpl::RECV_SYNC_EVENT_ID);
+                    if (AscendC::GetBlockIdx() < 2) {
+                        FUSED_MOE_DBG("sharedEp begin blk=%u\n", AscendC::GetBlockIdx());
+                    }
+                    if (!FUSED_MOE_SERIAL_MODE()) {
+                        // 1C2V：通知兄弟 sub1 开始 combine；串行模式（1C1V/A5 模拟）下无消费者，跳过避免事件残留
+                        AscendC::CrossCoreSetFlag<0x0, PIPE_MTE3>(MoeDistributeCombineImpl::SEND_SYNC_EVENT_ID);
+                        if constexpr ((EXEC_FLAG & EXEC_FLAG_DEEP_FUSE) == 0) {
+                            AscendC::CrossCoreSetFlag<0x0, PIPE_MTE3>(MoeDistributeCombineImpl::RECV_SYNC_EVENT_ID);
+                        }
                     }
                     gmC.SetGlobalBuffer(params.ptrSharedC);  // 必须重新赋值，不然下面还是用的路由专家数据
                     gmD.SetGlobalBuffer(params.ptrSharedD);  // 必须重新赋值，不然下面还是用的路由专家数据
@@ -659,23 +673,69 @@ public:
                         target += 1;
                         blockEpilogue(tensorBlockC, tensorBlockD, actualBlockShape, UINT32_MAX, 0, 0);
                     }
-                    AscendC::CrossCoreWaitFlag(MoeDistributeCombineImpl::SEND_SYNC_EVENT_ID);
-                    AscendC::CrossCoreWaitFlag(MoeDistributeCombineImpl::RECV_SYNC_EVENT_ID);
+                    if (AscendC::GetBlockIdx() < 2) {
+                        FUSED_MOE_DBG("sharedEp done blk=%u\n", AscendC::GetBlockIdx());
+                    }
+                    if (!FUSED_MOE_SERIAL_MODE()) {
+                        // 1C2V：等 sub1 combine 完成；串行模式下 combine 在本段之后才执行，此处必跳过否则死等
+                        AscendC::CrossCoreWaitFlag(MoeDistributeCombineImpl::SEND_SYNC_EVENT_ID);
+                        AscendC::CrossCoreWaitFlag(MoeDistributeCombineImpl::RECV_SYNC_EVENT_ID);
+                    }
                 }
             }
         }
 
+        if (AscendC::GetBlockIdx() < 2) {
+            // 派发角色打印：确认本核串行/并行与 sub 角色；没有此行说明卡在更早的 GEMM/epilogue 阶段
+            FUSED_MOE_DBG("dispatch blk=%u sub=%u subNum=%u serial=%u flag=%u\n", AscendC::GetBlockIdx(),
+                          AscendC::GetSubBlockIdx(), AscendC::GetSubBlockNum(),
+                          static_cast<uint32_t>(FUSED_MOE_SERIAL_MODE()), static_cast<uint32_t>(EXEC_FLAG));
+        }
         icache_preload(4);
         if constexpr (EXEC_FLAG & EXEC_FLAG_SHARED_EXPERT) {
-            if (AscendC::GetSubBlockIdx() == 1) {
+            if (FUSED_MOE_SERIAL_MODE()) {
+                // 1C1V（或 A5 模拟串行）：sub0 先写完共享专家输出，再串行跑 combine；sub1 空转
+                if (AscendC::GetSubBlockIdx() == 0) {
+                    resource.pipe.Init();
+                    combiner->TPipeSet(&resource.pipe);
+                    combiner->ProcessCombineSerial();
+                    combiner->TPipeSet(nullptr);
+                    resource.pipe.Destroy();
+                    if (AscendC::GetBlockIdx() < 2) {
+                        FUSED_MOE_DBG("SHARED serial combine DONE blk=%u\n", AscendC::GetBlockIdx());
+                    }
+                }
+            } else if (AscendC::GetSubBlockIdx() == 1) {
+                // 1C2V: sub1 承担 combine（sub0 并行写共享专家输出）
                 resource.pipe.Init();
                 combiner->TPipeSet(&resource.pipe);
                 combiner->ProcessCombine();
                 combiner->TPipeSet(nullptr);
                 resource.pipe.Destroy();
+                if (AscendC::GetBlockIdx() < 2) {
+                    FUSED_MOE_DBG("SHARED sub1 combine DONE blk=%u\n", AscendC::GetBlockIdx());
+                }
             }
         } else if constexpr (EXEC_FLAG & EXEC_FLAG_DEEP_FUSE) {
-            if (AscendC::GetSubBlockIdx() == 0) {
+            if (FUSED_MOE_SERIAL_MODE()) {
+                // 1C1V：唯一 AIV 串行承担发送+接收双角色（combiner 内已去掉 sub0<->sub1 事件会合）
+                uint64_t profWeightSumCombineStart = 0;
+                if (params.profile != nullptr) {
+                    profWeightSumCombineStart = params.profile->Now();
+                }
+                resource.pipe.Init();
+                combiner->TPipeSet(&resource.pipe);
+                combiner->DeepFuseCombineSerial();
+                combiner->TPipeSet(nullptr);
+                resource.pipe.Destroy();
+                if (AscendC::GetBlockIdx() < 2) {
+                    FUSED_MOE_DBG("DEEP_FUSE serial combine DONE blk=%u\n", AscendC::GetBlockIdx());
+                }
+                if (params.profile != nullptr) {
+                    params.profile->Record(FusedDeepMoeProfileStage::WeightSumReducePermute,
+                                           profWeightSumCombineStart, params.profile->Now());
+                }
+            } else if (AscendC::GetSubBlockIdx() == 0) {
                 uint64_t profWeightSumAllToAllSendStart = 0;
                 if (params.profile != nullptr) {
                     profWeightSumAllToAllSendStart = params.profile->Now();

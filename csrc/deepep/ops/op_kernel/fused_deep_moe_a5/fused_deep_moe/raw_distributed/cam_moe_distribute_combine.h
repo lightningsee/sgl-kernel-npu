@@ -9,6 +9,17 @@
 #include "../fused_deep_moe_utils.h"
 
 using namespace Cam;
+
+// 调试打印开关：默认关闭；编译期定义 FUSED_MOE_DEBUG_PRINT 开启（1C1V 串行路径 / A5 模拟调试用）。
+// 打印走核内调试 FIFO（容量有限），只在必要分支插桩并限制 block 数，调试完成后务必关闭。
+#if defined(FUSED_MOE_DEBUG_PRINT)
+#define FUSED_MOE_DBG(fmt, ...) AscendC::printf("[MOE_DBG] " fmt, ##__VA_ARGS__)
+#else
+#define FUSED_MOE_DBG(fmt, ...) \
+    do {                        \
+    } while (0)
+#endif
+
 namespace MoeDistributeCombineImpl {
 constexpr uint8_t BUFFER_NUM = 2;  // multi-buf
 constexpr uint32_t STATE_OFFSET = 512;
@@ -59,6 +70,11 @@ public:
     __aicore__ inline void AllToAllSend();
     __aicore__ inline void ReducePermute();
     __aicore__ inline void ProcessCombine();
+    // 1C1V 串行双角色 combine：等价 DEEP_FUSE 下 sub0 的 AllToAllSend + sub1 的 ReducePermute，
+    // 去掉全部 sub0<->sub1 CrossCore 事件会合（无兄弟 sub，程序顺序天然保证依赖）。仅 1C1V 调用，A5(1C2V) 不走此路径。
+    __aicore__ inline void DeepFuseCombineSerial();
+    // 1C1V 串行版 ProcessCombine：去掉入口 sub0<->sub1 SEND 事件会合，WaitDispatch 换无旗标自旋版。
+    __aicore__ inline void ProcessCombineSerial();
 
     __aicore__ inline CombineCalcInfo &GetCalcInfo()
     {
@@ -86,6 +102,7 @@ private:
     __aicore__ inline void SplitCoreCal();
     __aicore__ inline void SetStatus();
     __aicore__ inline void WaitDispatch();
+    __aicore__ inline void WaitDispatchSpin();  // WaitDispatch 去掉尾部 RECV 事件会合的自旋版本，仅 1C1V 串行路径使用
     __aicore__ GM_ADDR GetWinAddrByRankId(const int32_t rankId, const uint8_t domain, const uint8_t expertLocalId = 0U)
     {
         if (domain == EP_DOMAIN) {
@@ -766,6 +783,118 @@ __aicore__ inline void CamMoeDistributeCombine<TemplateMC2TypeFunc>::ProcessComb
     SetStatus();
     WaitDispatch();
     LocalWindowCopy();
+}
+
+// ProcessCombine 的 1C1V 串行版本：去掉入口 Set/Wait SEND 会合（无兄弟 sub，会合无意义且可能自配对死等），
+// WaitDispatch 换用去掉尾部 RECV 会合的 WaitDispatchSpin，其余与原函数逐行一致。
+template <TemplateMC2TypeClass>
+__aicore__ inline void CamMoeDistributeCombine<TemplateMC2TypeFunc>::ProcessCombineSerial()
+{
+    if (coreIdx_ < 2) {
+        FUSED_MOE_DBG("ProcessCombineSerial enter core=%u startRank=%u endRank=%u\n", coreIdx_, startRankId_,
+                      endRankId_);
+    }
+    if constexpr ((EXEC_FLAG & EXEC_FLAG_DEEP_FUSE) == 0) {
+        BuffInit();
+        SetWaitTpStatusAndDisPatch();
+        if (coreIdx_ < 2) {
+            FUSED_MOE_DBG("ProcessCombineSerial TpStatus done core=%u\n", coreIdx_);
+        }
+    }
+    AlltoAllBuffInit();
+    SetStatus();
+    if (coreIdx_ < 2) {
+        FUSED_MOE_DBG("ProcessCombineSerial SetStatus done core=%u\n", coreIdx_);
+    }
+    WaitDispatchSpin();
+    if (coreIdx_ < 2) {
+        FUSED_MOE_DBG("ProcessCombineSerial WaitDispatch done core=%u\n", coreIdx_);
+    }
+    LocalWindowCopy();
+    if (coreIdx_ < 2) {
+        FUSED_MOE_DBG("ProcessCombineSerial DONE core=%u\n", coreIdx_);
+    }
+}
+
+// WaitDispatch 的 1C1V 自旋版本：仅保留远端状态轮询，去掉尾部 sub0<->sub1 的 RECV 事件会合
+// （Set+Wait RECV）。1C1V 下不存在兄弟 sub，会合无意义且可能自配对死等。
+template <TemplateMC2TypeClass>
+__aicore__ inline void CamMoeDistributeCombine<TemplateMC2TypeFunc>::WaitDispatchSpin()
+{
+    if (startRankId_ < epWorldSize_) {
+        if (coreIdx_ < 2) {
+            // 挂死定位关键点：只看到 enter 没有 PASS，说明远端 rank 状态未就绪（对端未发布/未走到 SetStatus）
+            FUSED_MOE_DBG("WaitDispatchSpin enter core=%u startRank=%u epWorld=%u sendRankNum=%u sumTarget=%.1f\n",
+                          coreIdx_, startRankId_, epWorldSize_, sendRankNum_, sumTarget_);
+        }
+        LocalTensor<float> statusTensor = statusBuf_.Get<float>();
+        LocalTensor<float> gatherMaskOutTensor = gatherMaskOutBuf_.Get<float>();
+        LocalTensor<uint32_t> gatherTmpTensor = gatherTmpBuf_.Get<uint32_t>();
+        LocalTensor<float> statusSumOutTensor = statusSumOutBuf_.Get<float>();
+        PipeBarrier<PIPE_ALL>();
+
+        gatherTmpTensor.SetValue(0, 1);
+        uint32_t mask = 1;  // gatherMask + sum
+        uint64_t rsvdCnt = 0;
+        DataCopyParams intriParams{static_cast<uint16_t>(sendRankNum_), 1,
+                                   static_cast<uint16_t>((moeSendNum_ > 512) ? 7 : 15), 0};  // srcStride is 15 blocks
+        float sumOfFlag = static_cast<float>(-1.0);
+        float minTarget = (sumTarget_ * sendRankNum_) - (float)0.5;
+        float maxTarget = (sumTarget_ * sendRankNum_) + (float)0.5;
+        SumParams sumParams{1, sendRankNum_, sendRankNum_};
+        SyncFunc<AscendC::HardEvent::S_V>();
+        while ((sumOfFlag < minTarget) || (sumOfFlag > maxTarget)) {
+            DataCopy<float>(statusTensor, epStatusSpaceGlobalTensor_[startRankId_ * stateOffset_ / sizeof(float)],
+                            intriParams);
+            SyncFunc<AscendC::HardEvent::MTE2_V>();
+            GatherMask(gatherMaskOutTensor, statusTensor, gatherTmpTensor, true, mask,
+                       {1, (uint16_t)sendRankNum_, 1, 0}, rsvdCnt);
+            PipeBarrier<PIPE_V>();
+            Sum(statusSumOutTensor, gatherMaskOutTensor, sumParams);
+            SyncFunc<AscendC::HardEvent::V_S>();
+            sumOfFlag = statusSumOutTensor.GetValue(0);
+            if ((sumOfFlag < minTarget) || (sumOfFlag > maxTarget)) {
+                SPIN_WAIT_CYCLES();
+            }
+        }
+        if (coreIdx_ < 2) {
+            FUSED_MOE_DBG("WaitDispatchSpin PASS core=%u sum=%.1f\n", coreIdx_, sumOfFlag);
+        }
+    }
+}
+
+// 1C1V 串行双角色 combine（DEEP_FUSE）：同一 AIV 先做发送侧实质步骤（ReduceScatterTrans?/BuffInit/
+// SetStatus），再做接收侧实质步骤（AlltoAllBuffInit/WaitDispatch 自旋/LocalWindowCopy）。
+// 相比 AllToAllSend + ReducePermute，仅去掉 4 处 sub0<->sub1 CrossCore 事件会合，实质步骤与
+// Process() 的单核串行顺序一致。
+template <TemplateMC2TypeClass>
+__aicore__ inline void CamMoeDistributeCombine<TemplateMC2TypeFunc>::DeepFuseCombineSerial()
+{
+    if (coreIdx_ < 2) {
+        FUSED_MOE_DBG("DeepFuseCombineSerial enter core=%u startRank=%u endRank=%u\n", coreIdx_, startRankId_,
+                      endRankId_);
+    }
+    if constexpr (IsNeedReduceScatter) {
+        tpipe_->InitBuffer(moeQueue_, BUFFER_NUM, axisHExpandXTypeSize_);
+        ReduceScatterTrans();
+        if (coreIdx_ < 2) {
+            FUSED_MOE_DBG("DeepFuseCombineSerial ReduceScatter done core=%u\n", coreIdx_);
+        }
+    }
+    BuffInit();
+    AlltoAllBuffInit();
+    SetStatus();
+    if (coreIdx_ < 2) {
+        FUSED_MOE_DBG("DeepFuseCombineSerial SetStatus done core=%u\n", coreIdx_);
+    }
+    WaitDispatchSpin();
+    if (coreIdx_ < 2) {
+        FUSED_MOE_DBG("DeepFuseCombineSerial WaitDispatch done core=%u\n", coreIdx_);
+    }
+    LocalWindowCopy();
+    if (coreIdx_ < 2) {
+        FUSED_MOE_DBG("DeepFuseCombineSerial DONE core=%u\n", coreIdx_);
+    }
 }
 }  // namespace MoeDistributeCombineImpl
 
