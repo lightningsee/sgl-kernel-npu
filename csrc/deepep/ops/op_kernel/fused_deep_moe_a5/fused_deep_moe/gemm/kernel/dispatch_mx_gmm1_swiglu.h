@@ -32,7 +32,6 @@ constexpr uint32_t UB_ALIGN = 32;
 constexpr uint32_t TOKEN_EXTRA_SPACE = 512;
 constexpr uint32_t INT32_COUNT_PER_BLOCK = 8;
 constexpr int64_t REDUCE_SUM_WORK_SIZE = 4096;  // 最大支持64k-fp32累加
-constexpr int32_t SUB_AIV_NUM = 2;
 constexpr int32_t ODD_EVEN_BASE = 2;
 constexpr int32_t BUFFER_NUM = 2;
 constexpr int32_t GATHER_SECOND_NUM = 2;
@@ -244,7 +243,7 @@ public:
         subBlockNum = AscendC::GetSubBlockNum();
         aiCoreGroupIdx = AscendC::GetBlockIdx() / subBlockNum;
         aicNum = aiCoreGroupNum;
-        aivNum = aiCoreGroupNum * SUB_AIV_NUM;  // 1C2V
+        aivNum = aiCoreGroupNum * subBlockNum;  // 乘以真实 subblock 数：A5(1C2V)=2 / A6(1C1V)=1 自适应
         if ASCEND_IS_AIC {
             aicIdx = AscendC::GetBlockIdx();
         }
@@ -264,8 +263,8 @@ public:
             return;
         }
 
-        recvCoreNum = aiCoreGroupNum;
-        sendCoreNum = aiCoreGroupNum;
+        recvCoreNum = aiCoreGroupNum * subBlockNum / 2;  // 全部 AIV 一半收、一半发
+        sendCoreNum = recvCoreNum;
         if constexpr (EXEC_FLAG & EXEC_FLAG_SHARED_EXPERT) {
             shareQuantCoreNum = recvCoreNum;
         }
@@ -277,10 +276,18 @@ public:
             vToCFlag = (cvDataState == 0) ? V_TO_C_FLAG_1 : V_TO_C_FLAG_2;
         }
         if ASCEND_IS_AIV {
-            isRecvCore = ((aivIdx % ODD_EVEN_BASE) == 0);
-            recvCoreIdx = aiCoreGroupIdx;
-            isSendCore = ((aivIdx % ODD_EVEN_BASE) == 1);
-            sendCoreIdx = aiCoreGroupIdx;
+            // 块级角色专属：偶数块全员 send、奇数块全员 recv，逻辑索引跨块连续编号
+            uint32_t roleCoreIdx = (aiCoreGroupIdx / 2) * subBlockNum + AscendC::GetSubBlockIdx();
+            isSendCore = ((aiCoreGroupIdx % ODD_EVEN_BASE) == 0);
+            sendCoreIdx = roleCoreIdx;
+            isRecvCore = ((aiCoreGroupIdx % ODD_EVEN_BASE) == 1);
+            recvCoreIdx = roleCoreIdx;
+            // TODO(debug): 1C1V 角色/索引映射验证插桩，验证完成后删除
+            AscendC::printf("blkNum=%u blkIdx=%u subNum=%u subIdx=%u grpIdx=%u aivNum=%u recvNum=%u\n",
+                            aiCoreGroupNum, AscendC::GetBlockIdx(), subBlockNum, AscendC::GetSubBlockIdx(),
+                            aiCoreGroupIdx, aivNum, recvCoreNum);
+            AscendC::printf("isSend=%u isRecv=%u roleIdx=%u\n", static_cast<uint32_t>(isSendCore),
+                            static_cast<uint32_t>(isRecvCore), roleCoreIdx);
             if constexpr (EXEC_FLAG & EXEC_FLAG_SHARED_EXPERT) {
                 isShareQuantCore = isRecvCore;
                 shareQuantCoreIdx = recvCoreIdx;

@@ -59,7 +59,7 @@ npu_op_package_add(${package_name}
 )
 
 npu_op_kernel_options("" ALL OPTIONS
-    -DASCENDC_DUMP=0
+    -DASCENDC_DUMP=1
     --cce-auto-sync=off
     ${_DISPATCH_FFN_INC_OPTS}
     ${_A5_FUSED_DEEP_MOE_INC_OPTS})

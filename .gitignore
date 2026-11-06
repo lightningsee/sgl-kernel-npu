@@ -54,6 +54,12 @@ output/
 
 .codemate
 
+# cannbot workflow & IDE plugin assets (embedded git repos, not project code)
+.cannbot/
+.trae/
+/asc-devkit/
+/cann-samples/
+
 csrc/deepep/ops/cmake/
 csrc/deepep/ops/scripts/
 csrc/deepep/ops2/cmake/
