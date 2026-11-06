@@ -822,11 +822,9 @@ template <TemplateMC2TypeClass>
 __aicore__ inline void CamMoeDistributeCombine<TemplateMC2TypeFunc>::WaitDispatchSpin()
 {
     if (startRankId_ < epWorldSize_) {
-        if (coreIdx_ < 2) {
-            // 挂死定位关键点：只看到 enter 没有 PASS，说明远端 rank 状态未就绪（对端未发布/未走到 SetStatus）
-            FUSED_MOE_DBG("WaitDispatchSpin enter core=%u startRank=%u epWorld=%u sendRankNum=%u sumTarget=%.1f\n",
-                          coreIdx_, startRankId_, epWorldSize_, sendRankNum_, sumTarget_);
-        }
+        // 挂死定位关键点（全核放开）：只看到 enter 没有 PASS，说明远端 rank 状态未就绪（对端未发布/未走到 SetStatus）
+        FUSED_MOE_DBG("WaitDispatchSpin enter core=%u startRank=%u epWorld=%u sendRankNum=%u sumTarget=%.1f\n",
+                      coreIdx_, startRankId_, epWorldSize_, sendRankNum_, sumTarget_);
         LocalTensor<float> statusTensor = statusBuf_.Get<float>();
         LocalTensor<float> gatherMaskOutTensor = gatherMaskOutBuf_.Get<float>();
         LocalTensor<uint32_t> gatherTmpTensor = gatherTmpBuf_.Get<uint32_t>();
@@ -843,6 +841,8 @@ __aicore__ inline void CamMoeDistributeCombine<TemplateMC2TypeFunc>::WaitDispatc
         float maxTarget = (sumTarget_ * sendRankNum_) + (float)0.5;
         SumParams sumParams{1, sendRankNum_, sendRankNum_};
         SyncFunc<AscendC::HardEvent::S_V>();
+        uint32_t spinCnt = 0;
+        uint32_t spinNextPrint = 1U << 21;  // 首报约 2M 次轮询，之后指数退避，防止刷爆调试 FIFO
         while ((sumOfFlag < minTarget) || (sumOfFlag > maxTarget)) {
             DataCopy<float>(statusTensor, epStatusSpaceGlobalTensor_[startRankId_ * stateOffset_ / sizeof(float)],
                             intriParams);
@@ -854,12 +854,17 @@ __aicore__ inline void CamMoeDistributeCombine<TemplateMC2TypeFunc>::WaitDispatc
             SyncFunc<AscendC::HardEvent::V_S>();
             sumOfFlag = statusSumOutTensor.GetValue(0);
             if ((sumOfFlag < minTarget) || (sumOfFlag > maxTarget)) {
+                ++spinCnt;
+                if (spinCnt >= spinNextPrint) {
+                    // 卡死进度：sum 停在 need 区间外 = 对端 rank 状态未发布；sum 的具体值指示还差几份
+                    FUSED_MOE_DBG("WaitDispatchSpin spinning core=%u cnt=%u sum=%.1f need=[%.1f,%.1f]\n", coreIdx_,
+                                  spinCnt, sumOfFlag, minTarget, maxTarget);
+                    spinNextPrint <<= 1;
+                }
                 SPIN_WAIT_CYCLES();
             }
         }
-        if (coreIdx_ < 2) {
-            FUSED_MOE_DBG("WaitDispatchSpin PASS core=%u sum=%.1f\n", coreIdx_, sumOfFlag);
-        }
+        FUSED_MOE_DBG("WaitDispatchSpin PASS core=%u sum=%.1f\n", coreIdx_, sumOfFlag);
     }
 }
 
@@ -870,10 +875,8 @@ __aicore__ inline void CamMoeDistributeCombine<TemplateMC2TypeFunc>::WaitDispatc
 template <TemplateMC2TypeClass>
 __aicore__ inline void CamMoeDistributeCombine<TemplateMC2TypeFunc>::DeepFuseCombineSerial()
 {
-    if (coreIdx_ < 2) {
-        FUSED_MOE_DBG("DeepFuseCombineSerial enter core=%u startRank=%u endRank=%u\n", coreIdx_, startRankId_,
-                      endRankId_);
-    }
+    // 入口打印全核放开：每个参与核的 rank 分段可见，用于核对多核 rank 覆盖是否完整
+    FUSED_MOE_DBG("DeepFuseCombineSerial enter core=%u startRank=%u endRank=%u\n", coreIdx_, startRankId_, endRankId_);
     if constexpr (IsNeedReduceScatter) {
         tpipe_->InitBuffer(moeQueue_, BUFFER_NUM, axisHExpandXTypeSize_);
         ReduceScatterTrans();
