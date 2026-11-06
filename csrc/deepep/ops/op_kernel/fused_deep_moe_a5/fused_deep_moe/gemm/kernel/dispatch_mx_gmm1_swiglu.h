@@ -282,12 +282,6 @@ public:
             sendCoreIdx = roleCoreIdx;
             isRecvCore = ((aiCoreGroupIdx % ODD_EVEN_BASE) == 1);
             recvCoreIdx = roleCoreIdx;
-            // TODO(debug): 1C1V 角色/索引映射验证插桩，验证完成后删除
-            AscendC::printf("blkNum=%u blkIdx=%u subNum=%u subIdx=%u grpIdx=%u aivNum=%u recvNum=%u\n",
-                            aiCoreGroupNum, AscendC::GetBlockIdx(), subBlockNum, AscendC::GetSubBlockIdx(),
-                            aiCoreGroupIdx, aivNum, recvCoreNum);
-            AscendC::printf("isSend=%u isRecv=%u roleIdx=%u\n", static_cast<uint32_t>(isSendCore),
-                            static_cast<uint32_t>(isRecvCore), roleCoreIdx);
             if constexpr (EXEC_FLAG & EXEC_FLAG_SHARED_EXPERT) {
                 isShareQuantCore = isRecvCore;
                 shareQuantCoreIdx = recvCoreIdx;
@@ -1892,6 +1886,14 @@ public:
     {
         AscendC::SetCtrlSpr<60, 60>(0);
         AivInitParams(params);
+        // TODO(debug): 1C1V 角色/索引映射验证插桩，仅 rank0 打印，验证完成后删除
+        if (params.epRankId == 0) {
+            AscendC::printf("blkNum=%u blkIdx=%u subNum=%u subIdx=%u grpIdx=%u aivNum=%u recvNum=%u\n",
+                            aiCoreGroupNum, AscendC::GetBlockIdx(), subBlockNum, AscendC::GetSubBlockIdx(),
+                            aiCoreGroupIdx, aivNum, recvCoreNum);
+            AscendC::printf("isSend=%u isRecv=%u roleIdx=%u\n", static_cast<uint32_t>(isSendCore),
+                            static_cast<uint32_t>(isRecvCore), recvCoreIdx);
+        }
         if constexpr (EXEC_FLAG & EXEC_FLAG_DEEP_FUSE) {
             AivInitState();
             if constexpr (EXEC_FLAG & EXEC_FLAG_SHARED_EXPERT) {
