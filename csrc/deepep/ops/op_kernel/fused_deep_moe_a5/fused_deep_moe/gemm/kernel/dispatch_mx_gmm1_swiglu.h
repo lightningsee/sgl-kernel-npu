@@ -243,12 +243,19 @@ public:
         subBlockNum = AscendC::GetSubBlockNum();
         aiCoreGroupIdx = AscendC::GetBlockIdx() / subBlockNum;
         aicNum = aiCoreGroupNum;
-        aivNum = aiCoreGroupNum * subBlockNum;  // 乘以真实 subblock 数：A5(1C2V)=2 / A6(1C1V)=1 自适应
         if ASCEND_IS_AIC {
             aicIdx = AscendC::GetBlockIdx();
+            // AIC 侧 GetSubBlockNum() 恒返回 1（AIC block 无 sub 划分），
+            // AIV 物理核数须按平台形态推导，保证与 AIV 侧计算一致，否则状态槽错位死锁
+#if (defined(CATLASS_ARCH) && CATLASS_ARCH == 3510)
+            aivNum = aiCoreGroupNum * ODD_EVEN_BASE;  // 950(3510): 1C2V
+#else
+            aivNum = aiCoreGroupNum;  // 1C1V 架构
+#endif
         }
         if ASCEND_IS_AIV {
             aivIdx = AscendC::GetBlockIdx();
+            aivNum = aiCoreGroupNum * subBlockNum;  // AIV 侧真实 API：A5(1C2V)=2 / A6(1C1V)=1 自适应
         }
 
         winContext_ = (__gm__ Mc2Kernel::HcclOpParam *)AscendC::GetHcclContext<AscendC::HCCL_GROUP_ID_0>();
@@ -263,7 +270,7 @@ public:
             return;
         }
 
-        recvCoreNum = aiCoreGroupNum * subBlockNum / 2;  // 全部 AIV 一半收、一半发
+        recvCoreNum = aivNum / 2;  // 全部 AIV 一半收、一半发；aivNum 两侧已修正一致
         sendCoreNum = recvCoreNum;
         if constexpr (EXEC_FLAG & EXEC_FLAG_SHARED_EXPERT) {
             shareQuantCoreNum = recvCoreNum;
