@@ -263,9 +263,14 @@ _MX_QUANT_META = {
 }
 
 
-def get_mx_quant_config(quant_name: str) -> Dict[str, object]:
+def get_mx_quant_config(
+    quant_name: str, *, packed_fp4_activations: bool = False
+) -> Dict[str, object]:
     config = {"dispatch_quant_mode": 4}
-    for key, dtype_path in _MX_QUANT_META[quant_name].items():
+    dtype_meta = _MX_QUANT_META[quant_name]
+    if packed_fp4_activations:
+        dtype_meta = {**dtype_meta, "origin_dtype": "torch.uint8"}
+    for key, dtype_path in dtype_meta.items():
         module_name, attribute_name = dtype_path.split(".", 1)
         module = torch if module_name == "torch" else torch_npu
         config[key] = getattr(module, attribute_name)
@@ -299,9 +304,29 @@ def run_small_op_baseline(
     args: argparse.Namespace,
     gmm_burn_in_repeats: int = 1,
     warmup_burn_in_buffers: Tuple[torch.Tensor, torch.Tensor] = None,
+    situ_reference=fused_situ_reference,
+    *,
+    packed_fp4_weights: bool = False,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
-    quant_cfg = get_mx_quant_config(args.quant)
+    fp4_activations = packed_fp4_weights and args.quant == "fp4_e2m1"
+    quant_cfg = get_mx_quant_config(args.quant, packed_fp4_activations=fp4_activations)
     output_dtype = inputs["x"].dtype
+    activation_dtype = quant_cfg["origin_dtype"]
+    scale_dtype = torch.uint8 if packed_fp4_weights else torch.float8_e8m0fnu
+    weight_scale_arg = "scale"
+    gmm_options = {}
+    if packed_fp4_weights:
+        gmm_options.update(
+            weight_dtype=torch_npu.float4_e2m1fn_x2,
+            per_token_scale_dtype=torch_npu.float8_e8m0fnu,
+        )
+        if fp4_activations:
+            gmm_options.update(
+                x_dtype=torch_npu.float4_e2m1fn_x2,
+                scale_dtype=torch_npu.float8_e8m0fnu,
+            )
+        else:
+            weight_scale_arg = "antiquant_scale"
 
     outputs = torch_npu.npu_moe_distribute_dispatch_v2(
         x=inputs["x"],
@@ -342,41 +367,34 @@ def run_small_op_baseline(
         for _ in range(gmm_burn_in_repeats):
             _ = torch.matmul(burn_in_lhs, burn_in_rhs)
 
-    dynamic_scales = dynamic_scales.view(*(dynamic_scales.shape[:-1]), -1, 2).view(
-        torch.float8_e8m0fnu
-    )
-    y1_fp = torch_npu.npu_grouped_matmul(
-        x=[expand_x],
-        weight=[inputs["gmm1_weight_q"]],
-        scale=[inputs["gmm1_weight_scale"]],
-        per_token_scale=[dynamic_scales],
-        split_item=2,
-        group_list_type=1,
-        group_type=0,
-        group_list=expert_token_nums,
-        output_dtype=output_dtype,
-    )[0]
+    def run_gmm(layer, activations, token_scales):
+        return torch_npu.npu_grouped_matmul(
+            x=[activations],
+            weight=[inputs[f"gmm{layer}_weight_q"]],
+            per_token_scale=[token_scales.view(scale_dtype)],
+            split_item=2,
+            group_list_type=1,
+            group_type=0,
+            group_list=expert_token_nums,
+            output_dtype=output_dtype,
+            **{weight_scale_arg: [inputs[f"gmm{layer}_weight_scale"]]},
+            **gmm_options,
+        )[0]
+
+    dynamic_scales = dynamic_scales.view(*dynamic_scales.shape[:-1], -1, 2)
+    if fp4_activations:
+        expand_x = expand_x.view(activation_dtype)
+    y1_fp = run_gmm(1, expand_x, dynamic_scales)
     if args.activation == "situ":
-        activation_out = fused_situ_reference(y1_fp, args.beta, args.linear_beta)
+        activation_out = situ_reference(
+            y1_fp, beta=args.beta, linear_beta=args.linear_beta
+        )
     else:
         activation_out = torch_npu.npu_swiglu(y1_fp)
     x2, x2_scale = torch_npu.npu_dynamic_mx_quant(
         activation_out, dst_type=quant_cfg["quant_dst_type"]
     )
-    x2 = x2.view(quant_cfg["origin_dtype"])
-
-    x2_scale = x2_scale.view(torch.float8_e8m0fnu)
-    y2_fp = torch_npu.npu_grouped_matmul(
-        x=[x2],
-        weight=[inputs["gmm2_weight_q"]],
-        scale=[inputs["gmm2_weight_scale"]],
-        per_token_scale=[x2_scale],
-        split_item=2,
-        group_list_type=1,
-        group_type=0,
-        group_list=expert_token_nums,
-        output_dtype=output_dtype,
-    )[0]
+    y2_fp = run_gmm(2, x2.view(activation_dtype), x2_scale)
     output = torch_npu.npu_moe_distribute_combine_v2(
         expand_x=y2_fp,
         expert_ids=inputs["expert_ids"],
