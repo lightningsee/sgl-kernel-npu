@@ -1159,12 +1159,13 @@ def check_a5_scale_sensitivity(
             f"changed_error={changed_error}, unchanged_error={unchanged_error}"
         )
 
-    # 整体抬高 L1 scale：激活是非线性的，只要求输出发生明显变化。
-    def all_ones(length):
-        return torch.ones(length, dtype=torch.uint8, device=device)
-
     l1_out, l1_counts = run_with(
-        {"fused_l1_scales": shifted_scales(weights["fused_l1_scales"], all_ones)}
+        {
+            "fused_l1_scales": [
+                (scale.view(torch.uint8) - 16).view(scale.dtype)
+                for scale in weights["fused_l1_scales"]
+            ]
+        }
     )
     torch.testing.assert_close(l1_counts, reference_counts, rtol=0, atol=0)
     l1_change = (l1_out.float() - reference).norm().item() / max(signal, 1e-6)
